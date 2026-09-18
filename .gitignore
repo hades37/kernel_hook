@@ -1,0 +1,10 @@
+# build
+build/
+*.o
+*.so
+*.a
+
+# generated hook outputs
+out_*/
+msprof_hook_out/
+*.csv.tmp
