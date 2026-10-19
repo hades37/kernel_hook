@@ -76,6 +76,8 @@ msprof --output=/tmp/prof --ascendcl=on --task-time=on --ge-api=l1 ./your_app
 |------|------|------|
 | `MSPROF_HOOK_OUT` | CSV 输出目录 | `./msprof_hook_out` |
 | `MSPROF_HOOK_VERBOSE` | 是否把解码记录打到 stderr | 关 |
+| `MSPROF_HOOK_RAW_OP` | 精确算子名；启用该算子的原始 Msprof report 审计 | 未设置 |
+| `MSPROF_HOOK_RAW_OP_HASH` | 可选十进制或 `0x` 十六进制 op hash；与名称过滤为 OR | 未设置 |
 
 ## 输出
 
@@ -109,6 +111,22 @@ hash,string
 ```
 
 所有进程内出现过的 `hash -> 字符串`，便于离线 join 或排查未还原的 hash。
+
+### `raw_reports.jsonl`（可选原始 report 审计）
+
+只有设置 `MSPROF_HOOK_RAW_OP` 或 `MSPROF_HOOK_RAW_OP_HASH` 时才会在
+`MSPROF_HOOK_OUT/raw_reports.jsonl` 写入该文件。它逐条记录匹配目标的 hash 注册、API、
+compact basic info 和 tensor info；batch tensor info 按原始数组位置逐项记录，不跨 report
+join。每行保留 `entrypoint`、单进程捕获顺序 `event_seq`、header 时间/TID/hash、调用长度及
+原始五个 tensor slot 的数字 dtype/format/type 和八维 shape。未知 hash 不按相似名称或邻近
+记录推断归属；可用显式 `MSPROF_HOOK_RAW_OP_HASH` 精确筛选 hash。
+
+TensorInfo 的 `data_len` 原样保留为声明值；raw audit 读取时只以回调实际 `length` 和固定
+payload 容量为界，因此可检查声明长度与可读 payload 不一致的报告。`legacy_accept` 和
+`legacy_reject_reason` 显示原有 CSV collector 是否接受该记录，便于区分“原始报告含张量信息”
+与“既有 CSV 解码器接受了报告”。该审计不改原有 CSV 的解析/聚合，也不改 SDK 调用：输入指针、
+长度和 flags 原样转发一次，并返回原接口状态。审计文件打开或写入失败时只关闭 raw audit，
+不影响原 collector 或 SDK 结果。未启用时不会创建该文件。
 
 ## 实测样例（Kimi-K3 mini 微调）
 
