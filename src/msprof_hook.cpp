@@ -199,8 +199,11 @@ struct HookState {
 
 HookState &State()
 {
-    static HookState state;
-    return state;
+    // MsprofHookFini runs during DSO teardown, after ordinary C++ static
+    // destructors may already have run. Keep the state alive until process
+    // reclamation so the final flush never touches destroyed containers.
+    static HookState *state = new HookState();
+    return *state;
 }
 
 void Mkdirs(const std::string &path)
