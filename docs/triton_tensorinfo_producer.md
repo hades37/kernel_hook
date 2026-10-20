@@ -2,7 +2,7 @@
 
 The Ascend Triton launcher builds `MsprofAdditionalInfo tensorInfo` without value-initializing it or setting `dataLen`. The profiling hook receives the fixed-size additional-info payload, but rejects the TensorInfo report when its declared length is zero. This process-local overlay repairs both generated TensorInfo blocks before the native launcher factory sees the C++ source.
 
-The same factory boundary now also repairs supported `MsprofCompactInfo` blocks. If a block has no `dataLen`, the overlay sets it to `sizeof(MsprofNodeBasicInfo)`—the payload size, not the enclosing `sizeof(MsprofCompactInfo)` report size. If `opFlag` is absent, it sets zero only for the recognized AIV layout with one `taskType = MSPROF_GE_TASK_TYPE_AIV` assignment and no `mode`/`execMode` field. An existing recognized `opFlag` assignment is preserved, and a recognized block with either or both supported fields missing gets only the missing field or fields filled. Unknown, conflicting, or conditional block shapes fail closed. The overlay does not zero-initialize the whole CompactInfo object, change the report call or its length, alter the SDK/ABI, or modify the installed driver or cache implementation.
+The same factory boundary now also repairs supported `MsprofCompactInfo` blocks. If a block has no `dataLen`, the overlay sets it to `sizeof(MsprofNodeBasicInfo)`—the payload size, not the enclosing `sizeof(MsprofCompactInfo)` report size. If `opFlag` is absent, it sets zero for the four task types emitted by the current generator: `MSPROF_GE_TASK_TYPE_AIV`, `MSPROF_GE_TASK_TYPE_AI_CORE`, `MSPROF_GE_TASK_TYPE_MIX_AIC`, and `MSPROF_GE_TASK_TYPE_MIX_AIV`. This `taskType` is distinct from `TaskInfo.execMode`: HF32 is carried through that separate execution-mode path and is not inferred from the task type. An existing recognized `opFlag` assignment is preserved, and a recognized block with either or both supported fields missing gets only the missing field or fields filled. Unknown task types, conflicting assignments, and conditional block shapes fail closed. The overlay does not zero-initialize the whole CompactInfo object, change the report call or its length, alter the SDK/ABI, or modify the installed driver or cache implementation.
 
 The overlay wraps `make_npu_launcher_stub` in the already registered Ascend driver's globals. It does not import a second `triton.backends.ascend.driver` module or instantiate the driver to find that namespace. Both supported driver layouts use this factory: one builds source through `generate_npu_wrapper_src`, the other through `make_launcher`. The native factory still receives the source and performs its existing cache lookup, debug dump, and compile. The cache key naturally includes the changed source; the overlay leaves old cache entries and installed driver files alone.
 
@@ -14,7 +14,7 @@ The Python CPU contract tests use fake registered backends and do not need Trito
 python3 test/test_triton_tensorinfo_overlay.py
 ```
 
-The CompactInfo SDK probe compiles captured local and physical source excerpts against the actual CANN SDK header, then calls the original report path through a CPU stub. It checks SDK field layout and report arguments without requiring an NPU or CANN runtime library. Point it at the SDK directory containing `profiling/aprof_pub.h`:
+The CompactInfo SDK probe substitutes each of the four generator task types into both captured local and physical source excerpts, one source field at a time. Through the registered factory seam it compiles each result against the actual CANN SDK header, then calls the original report path through a CPU stub. It checks the selected task type, default `opFlag`, SDK field layout, payload length, and report arguments without requiring an NPU or CANN runtime library. Point it at the SDK directory containing `profiling/aprof_pub.h`:
 
 ```bash
 python3 test/test_compact_header_contract.py \
@@ -22,7 +22,7 @@ python3 test/test_compact_header_contract.py \
   --sdk-include-dir /root/miniconda3/envs/cann910/Ascend/cann-9.1.0/include/experiment/msprof
 ```
 
-To confirm that the probe detects the old producer, pass a baseline overlay snapshot with `--overlay-script`; the expected result is a failed CompactInfo contract check:
+To check the earlier AIV-only guard, pass its overlay snapshot with `--overlay-script`. The AIV cases should pass, then the first `AI_CORE` case should be rejected; that nonzero exit is the expected RED signal for the expanded matrix:
 
 ```bash
 python3 test/test_compact_header_contract.py \

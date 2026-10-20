@@ -18,6 +18,14 @@ from typing import Any
 
 
 FACTORY_NAME = "make_npu_launcher_stub"
+DEFAULT_ZERO_OP_FLAG_TASK_TYPES = frozenset(
+    {
+        "MSPROF_GE_TASK_TYPE_AIV",
+        "MSPROF_GE_TASK_TYPE_AI_CORE",
+        "MSPROF_GE_TASK_TYPE_MIX_AIC",
+        "MSPROF_GE_TASK_TYPE_MIX_AIV",
+    }
+)
 RAW_DECLARATION = re.compile(
     r"(?m)^(?P<indent>[ \t]*)MsprofAdditionalInfo tensorInfo;[ \t]*(?P<cr>\r?)$"
 )
@@ -206,15 +214,20 @@ def _patch_compact_info_source(source: str) -> tuple[str, int]:
                 r"(?P<rhs>[^;\r\n]+?)\s*;"
             )
             task_type_assignments = list(task_type_assignment.finditer(block))
+            task_type_value = (
+                task_type_assignments[0].group("rhs").strip()
+                if len(task_type_assignments) == 1
+                else "<missing-or-ambiguous>"
+            )
             if (
                 mode_or_exec_mode.search(block)
                 or len(list(task_type_reference.finditer(block))) != 1
                 or len(task_type_assignments) != 1
-                or task_type_assignments[0].group("rhs").strip()
-                != "MSPROF_GE_TASK_TYPE_AIV"
+                or task_type_value not in DEFAULT_ZERO_OP_FLAG_TASK_TYPES
             ):
                 raise ValueError(
-                    f"CompactInfo {name!r} needs an explicit opFlag outside the exact AIV template"
+                    f"CompactInfo {name!r} needs an explicit opFlag for unsupported "
+                    f"taskType {task_type_value!r} or mode/execMode template"
                 )
 
         assignments: list[str] = []

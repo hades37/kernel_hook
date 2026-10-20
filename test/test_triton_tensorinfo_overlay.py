@@ -399,6 +399,62 @@ class FactoryPatchTests(unittest.TestCase):
 
 
 class CapturedCompactInfoFactoryTests(unittest.TestCase):
+    def test_known_task_type_variants_receive_default_compact_metadata(self) -> None:
+        task_types = (
+            "MSPROF_GE_TASK_TYPE_AIV",
+            "MSPROF_GE_TASK_TYPE_AI_CORE",
+            "MSPROF_GE_TASK_TYPE_MIX_AIC",
+            "MSPROF_GE_TASK_TYPE_MIX_AIV",
+        )
+        sources = saved_generated_wrapper_sources()
+        for fixture_name, original_source in sources.items():
+            entrypoint = (
+                "generate_npu_wrapper_src"
+                if fixture_name == "local-generate_npu_wrapper_src"
+                else "make_launcher"
+            )
+            for task_type in task_types:
+                with self.subTest(fixture=fixture_name, task_type=task_type):
+                    original_task_type = (
+                        "nodeBasicInfo.data.nodeBasicInfo.taskType = "
+                        "MSPROF_GE_TASK_TYPE_AIV;"
+                    )
+                    task_source = original_source.replace(
+                        original_task_type,
+                        f"nodeBasicInfo.data.nodeBasicInfo.taskType = {task_type};",
+                    )
+                    self.assertEqual(task_source.count(f"taskType = {task_type};"), 2)
+
+                    namespace, registry, factory_calls = make_registered_backend(
+                        "triton.backends.ascend.driver",
+                        wrapper_sources={fixture_name: task_source},
+                    )
+                    audit_records: list[dict[str, object]] = []
+                    with overlay.install_registered_backend_patch(
+                        registry, audit_callback=audit_records.append
+                    ):
+                        launcher_class = namespace["NPULauncher"]
+                        launcher = object.__new__(launcher_class)
+                        launcher.template_entrypoint = entrypoint
+                        launcher.debug = False
+                        result = launcher._make_launcher_stub_path()
+
+                    forwarded_source = factory_calls[0]["wrapper_src"]
+                    assert isinstance(forwarded_source, str)
+                    assert_default_compact_metadata(self, forwarded_source)
+                    self.assertEqual(
+                        remove_default_compact_metadata(forwarded_source),
+                        expected_initialized_source(task_source),
+                    )
+                    self.assertEqual(forwarded_source.count(f"taskType = {task_type};"), 2)
+                    self.assertEqual(forwarded_source.count("nodeBasicInfo.data.nodeBasicInfo.blockDim = nodeBasicBlockDim;"), 2)
+                    self.assertEqual(forwarded_source.count(COMPACT_REPORT), 2)
+                    self.assertEqual(len(factory_calls), 1)
+                    self.assertEqual(result["cache_key"], factory_calls[0]["cache_key"])
+                    self.assertEqual(audit_records[0]["return_status"], "ok")
+                    self.assertEqual(audit_records[0]["replacement_count"], 2)
+                    self.assertEqual(audit_records[0]["compact_replacement_count"], 2)
+
     def test_saved_local_and_physical_templates_get_defaults_through_registry_factory(self) -> None:
         sources = saved_generated_wrapper_sources()
         for source in sources.values():
@@ -569,9 +625,9 @@ class CapturedCompactInfoFactoryTests(unittest.TestCase):
                 + COMPACT_REPORT,
                 1,
             ),
-            "non-aiv-without-op-flag": source.replace(
+            "unknown-task-type-without-op-flag": source.replace(
                 "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AIV;",
-                "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AICORE;",
+                "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_UNKNOWN;",
                 1,
             ),
             "exec-mode-without-op-flag": source.replace(

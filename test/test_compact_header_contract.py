@@ -25,6 +25,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 LOCAL_EXCERPT = ROOT / "test" / "triton_launcher_local_compact_excerpt.cxx"
 PHYSICAL_EXCERPT = ROOT / "test" / "triton_launcher_physical_compact_excerpt.cxx"
+KNOWN_TASK_TYPES = (
+    "MSPROF_GE_TASK_TYPE_AIV",
+    "MSPROF_GE_TASK_TYPE_AI_CORE",
+    "MSPROF_GE_TASK_TYPE_MIX_AIC",
+    "MSPROF_GE_TASK_TYPE_MIX_AIV",
+)
+RAW_TASK_TYPE_ASSIGNMENT = (
+    "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AIV;"
+)
 
 HEADER_SOURCE = r'''#include <profiling/aprof_pub.h>
 #include <cstddef>
@@ -39,6 +48,7 @@ constexpr uint64_t kExpectedOpName = UINT64_C(0x1122334455667788);
 constexpr uint32_t kExpectedThreadId = UINT32_C(0x3456);
 constexpr uint64_t kExpectedTimestamp = UINT64_C(0x778899AABBCCDDEE);
 constexpr uint32_t kExpectedBlockDim = UINT32_C(73);
+constexpr uint32_t kExpectedTaskType = __EXPECTED_TASK_TYPE__;
 constexpr size_t kExpectedCallCount = 2;
 
 struct CapturedCompactInfo {
@@ -176,8 +186,8 @@ class NPULauncher:
 
 
 def capture_patched_source(overlay, module_alias: str, entrypoint: str,
-                           excerpt_path: Path) -> str:
-    original_source = excerpt_path.read_text(encoding="utf-8")
+                           excerpt_path: Path, source_override: str) -> str:
+    original_source = source_override
     if original_source.count("MsprofCompactInfo nodeBasicInfo;") != 2:
         raise AssertionError(
             f"{excerpt_path.name} must contain both captured CompactInfo report sections"
@@ -260,11 +270,16 @@ def add_deterministic_poison(source: str) -> str:
     return RAW_COMPACT_DECLARATION.sub(poison, source)
 
 
-def make_cpp_source(effective_wrapper_source: str) -> str:
+def make_cpp_source(effective_wrapper_source: str, expected_task_type: str) -> str:
+    if expected_task_type not in KNOWN_TASK_TYPES:
+        raise AssertionError(f"unsupported probe task type: {expected_task_type}")
+    cpp_support = CPP_SUPPORT.replace(
+        "__EXPECTED_TASK_TYPE__", expected_task_type
+    )
     wrapper_source = add_deterministic_poison(effective_wrapper_source)
     return (
         HEADER_SOURCE
-        + CPP_SUPPORT
+        + cpp_support
         + r'''
 int main()
 {
@@ -304,15 +319,15 @@ int main()
         }
         if (record.op_name != kExpectedOpName ||
             record.op_type != kExpectedOpName ||
-            record.task_type != MSPROF_GE_TASK_TYPE_AIV ||
+            record.task_type != kExpectedTaskType ||
             record.block_dim != kExpectedBlockDim || record.op_flag != 0) {
             return Fail("MsprofNodeBasicInfo fields were not preserved/initialized");
         }
     }
-    std::printf("COMPACT_HEADER_CONTRACT_PROBE_OK calls=%zu node_basic_size=%zu "
-                "compact_size=%zu\n",
-                g_compact_call_count, sizeof(MsprofNodeBasicInfo),
-                sizeof(MsprofCompactInfo));
+    std::printf("COMPACT_HEADER_CONTRACT_PROBE_OK calls=%zu task_type=%u "
+                "node_basic_size=%zu compact_size=%zu\n",
+                g_compact_call_count, g_captured[0].task_type,
+                sizeof(MsprofNodeBasicInfo), sizeof(MsprofCompactInfo));
     return 0;
 }
 '''
@@ -356,10 +371,12 @@ def compile_and_run(source: str, cxx: str, sdk_include_dir: Path,
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
         if (
-            "COMPACT_HEADER_CONTRACT_PROBE_OK calls=2 node_basic_size=" not in result.stdout
+            "COMPACT_HEADER_CONTRACT_PROBE_OK calls=2 task_type=" not in result.stdout
+            or "node_basic_size=" not in result.stdout
             or "compact_size=" not in result.stdout
         ):
             raise AssertionError(f"{label}: probe success marker missing: {result.stdout!r}")
+        print(f"{label}: {result.stdout.strip()}")
 
 
 def run(cxx: str, sdk_include_dir: Path, overlay_script: Path) -> None:
@@ -384,15 +401,35 @@ def run(cxx: str, sdk_include_dir: Path, overlay_script: Path) -> None:
             PHYSICAL_EXCERPT,
         ),
     )
-    for label, module_alias, entrypoint, excerpt in cases:
+    for template_label, module_alias, entrypoint, excerpt in cases:
         if not excerpt.is_file():
             raise FileNotFoundError(f"CompactInfo source fixture is missing: {excerpt}")
-        patched_source = capture_patched_source(
-            overlay, module_alias, entrypoint, excerpt
-        )
-        compile_and_run(
-            make_cpp_source(patched_source), cxx, sdk_include_dir, label
-        )
+        original_source = excerpt.read_text(encoding="utf-8")
+        if original_source.count(RAW_TASK_TYPE_ASSIGNMENT) != 2:
+            raise AssertionError(
+                f"{excerpt.name} must contain exactly two default AIV taskType assignments"
+            )
+        for task_type in KNOWN_TASK_TYPES:
+            task_assignment = RAW_TASK_TYPE_ASSIGNMENT.replace(
+                "MSPROF_GE_TASK_TYPE_AIV", task_type
+            )
+            task_source = original_source.replace(
+                RAW_TASK_TYPE_ASSIGNMENT, task_assignment
+            )
+            if task_source.count(task_assignment) != 2:
+                raise AssertionError(
+                    f"{excerpt.name} taskType-only substitution failed for {task_type}"
+                )
+            label = f"{template_label} / {task_type}"
+            patched_source = capture_patched_source(
+                overlay, module_alias, entrypoint, excerpt, task_source
+            )
+            compile_and_run(
+                make_cpp_source(patched_source, task_type),
+                cxx,
+                sdk_include_dir,
+                label,
+            )
 
 
 def main() -> int:
@@ -408,7 +445,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         run(args.cxx, args.sdk_include_dir, args.overlay_script)
-    except (AssertionError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except (
+        AssertionError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as error:
         print(f"test_compact_header_contract: FAIL: {error}", file=sys.stderr)
         return 1
     print(
