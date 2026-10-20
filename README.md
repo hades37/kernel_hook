@@ -44,6 +44,15 @@ bash build.sh --debug -j 16   # Debug + 16 线程
 # 产物：build/libmsprof_hook.so
 ```
 
+构建工具链需与加载 hook 的目标 Python/系统 loader 兼容；已遇到 Nix g++ 16 构建要求 `GLIBC_2.38`，目标 NPU Python 无法加载的情况。可用系统 GCC 11 在新目录构建：
+
+```bash
+cmake -S . -B build/runtime -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++
+cmake --build build/runtime
+```
+
+使用新目录可避免复用已选 Nix 编译器的 `CMakeCache`；此命令不改 `build.sh` 默认或已有构建缓存。
+
 ## 使用
 
 ### 方式 1：直接 LD_PRELOAD
@@ -96,7 +105,11 @@ output_num,output_formats,output_dtypes,output_shapes
 ```
 
 按 `(thread_id, op_name_hash, timestamp)` 聚合：`node_basic_info` 与同一时刻的
-多条 `tensor_info` 会合并成一行，得到完整的算子名 + 输入/输出参数。
+多条 `tensor_info` 会合并成一行，得到本次实际报告的算子名与输入/输出参数。
+
+SDK 单包最多包含 5 个 tensor slot、每个 shape 最多 8 个维度；当前 Triton producer 只发一个包，超出容量会截断。
+SDK shape 数组未携带 rank，零长度维度与填充零无法无损区分；CSV 还会省略零项。raw JSON 保留八个原值，但不据此推断完整 rank。
+TensorInfo producer 修复需通过 [proxy 或 CLI overlay](docs/triton_tensorinfo_producer.md) 启用；仅用 `LD_PRELOAD` 加载 hook 不会修改 producer。
 
 ### dtype 标签
 
