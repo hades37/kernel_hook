@@ -98,6 +98,30 @@ output_num,output_formats,output_dtypes,output_shapes
 按 `(thread_id, op_name_hash, timestamp)` 聚合：`node_basic_info` 与同一时刻的
 多条 `tensor_info` 会合并成一行，得到完整的算子名 + 输入/输出参数。
 
+### dtype 标签
+
+`input_dtypes` 和 `output_dtypes` 按 Msprof tensor report 中的 `ge::DataType` 数值生成。
+CANN 9.1 的枚举定义见 SDK 公共头文件 `graph/c_types.h`（`C_DataType` / `C_DT_*`）；ACL 的
+`aclDataType` 是其中一部分，两者对应的数据类型使用相同数值。CSV 标签去掉 `C_DT_` 前缀，
+例如 `27` 为 `BF16`、`29` 为 `INT4`、`30` 为 `UINT1`，`28` 为 `UNDEFINED`。其余 GE 类型也按
+枚举名输出，例如 `14`/`15` 为 `DUAL_SUB_INT8`/`DUAL_SUB_UINT8`，`18`–`26` 为量化、资源、
+引用字符串、双输出及变体类型，`31`/`32` 为 `INT2`/`UINT2`，`42` 为 `HIFLOAT4`。
+
+数值 `5` 是保留值，`43` 是 `C_DT_MAX` 边界标记；它们、ACL 的 `-1` 哨兵（report 的无符号字段
+中表现为 `0xffffffff`）以及其他未知数值都输出 `UNKNOWN`。更新 hook 后，之后新采集的 CSV 会使用
+新的标签映射；已经写出的 CSV 是静态文件，不会被回写或改名。可选的 `raw_reports.jsonl` 保留
+report 中原始数字 dtype，不随标签映射变化。
+
+可在有 CANN SDK 头文件和 C++ 编译器的 CPU 环境运行契约检查；无需 NPU 或 CANN 运行时库：
+
+```bash
+python3 test/test_dtype_contract.py --sdk-include-dir /path/to/cann/x86_64-linux/include
+```
+
+该 include 目录需同时包含 `acl/acl_base.h` 和 `graph/c_types.h`。若已通过环境变量
+`ASCEND_HOME_PATH`、`ASCEND_TOOLKIT_HOME`、`CANN_HOME` 或 `ASCEND_HOME` 配置 SDK，也可直接运行
+`python3 test/test_dtype_contract.py`。
+
 ### `launch.csv`
 
 ```

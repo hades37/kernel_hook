@@ -94,6 +94,8 @@ const char *FormatName(uint32_t format)
     }
 }
 
+// Msprof tensor dataType carries ge::DataType values. ACL exposes a subset
+// with the same numeric codes; keep the full GE mapping for the report field.
 const char *DataTypeName(uint32_t dtype)
 {
     switch (dtype) {
@@ -102,17 +104,43 @@ const char *DataTypeName(uint32_t dtype)
         case 2: return "INT8";
         case 3: return "INT32";
         case 4: return "UINT8";
-        case 5: return "INT16";
-        case 6: return "UINT16";
-        case 7: return "UINT32";
-        case 8: return "INT64";
-        case 9: return "UINT64";
-        case 10: return "DOUBLE";
-        case 11: return "BOOL";
-        case 12: return "STRING";
-        case 16: return "BF16";
-        case 27: return "INT4";
-        case 29: return "UINT1";
+        case 6: return "INT16";
+        case 7: return "UINT16";
+        case 8: return "UINT32";
+        case 9: return "INT64";
+        case 10: return "UINT64";
+        case 11: return "DOUBLE";
+        case 12: return "BOOL";
+        case 13: return "STRING";
+        case 14: return "DUAL_SUB_INT8";
+        case 15: return "DUAL_SUB_UINT8";
+        case 16: return "COMPLEX64";
+        case 17: return "COMPLEX128";
+        case 18: return "QINT8";
+        case 19: return "QINT16";
+        case 20: return "QINT32";
+        case 21: return "QUINT8";
+        case 22: return "QUINT16";
+        case 23: return "RESOURCE";
+        case 24: return "STRING_REF";
+        case 25: return "DUAL";
+        case 26: return "VARIANT";
+        case 27: return "BF16";
+        case 28: return "UNDEFINED";
+        case 29: return "INT4";
+        case 30: return "UINT1";
+        case 31: return "INT2";
+        case 32: return "UINT2";
+        case 33: return "COMPLEX32";
+        case 34: return "HIFLOAT8";
+        case 35: return "FLOAT8_E5M2";
+        case 36: return "FLOAT8_E4M3FN";
+        case 37: return "FLOAT8_E8M0";
+        case 38: return "FLOAT6_E3M2";
+        case 39: return "FLOAT6_E2M3";
+        case 40: return "FLOAT4_E2M1";
+        case 41: return "FLOAT4_E1M2";
+        case 42: return "HIFLOAT4";
         default: return "UNKNOWN";
     }
 }
