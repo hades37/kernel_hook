@@ -1,16 +1,37 @@
-# Triton TensorInfo producer overlay
+# Triton producer metadata overlay
 
 The Ascend Triton launcher builds `MsprofAdditionalInfo tensorInfo` without value-initializing it or setting `dataLen`. The profiling hook receives the fixed-size additional-info payload, but rejects the TensorInfo report when its declared length is zero. This process-local overlay repairs both generated TensorInfo blocks before the native launcher factory sees the C++ source.
 
+The same factory boundary now also repairs supported `MsprofCompactInfo` blocks. If a block has no `dataLen`, the overlay sets it to `sizeof(MsprofNodeBasicInfo)`—the payload size, not the enclosing `sizeof(MsprofCompactInfo)` report size. If `opFlag` is absent, it sets zero only for the recognized AIV layout with one `taskType = MSPROF_GE_TASK_TYPE_AIV` assignment and no `mode`/`execMode` field. An existing recognized `opFlag` assignment is preserved, and a recognized block with either or both supported fields missing gets only the missing field or fields filled. Unknown, conflicting, or conditional block shapes fail closed. The overlay does not zero-initialize the whole CompactInfo object, change the report call or its length, alter the SDK/ABI, or modify the installed driver or cache implementation.
+
 The overlay wraps `make_npu_launcher_stub` in the already registered Ascend driver's globals. It does not import a second `triton.backends.ascend.driver` module or instantiate the driver to find that namespace. Both supported driver layouts use this factory: one builds source through `generate_npu_wrapper_src`, the other through `make_launcher`. The native factory still receives the source and performs its existing cache lookup, debug dump, and compile. The cache key naturally includes the changed source; the overlay leaves old cache entries and installed driver files alone.
 
-Every new launcher factory call is checked. A source with exactly two uninitialized TensorInfo blocks gets value-initialized declarations and `dataLen = sizeof(MsprofTensorInfo)` in both blocks. A source with exactly two correctly initialized blocks is passed through unchanged and records `replacement_count: 0`. Partial or unknown layouts fail closed. Other fields and report calls pass through unchanged, and there is no operator-name selector.
+Every new launcher factory call is checked. A source with exactly two uninitialized TensorInfo blocks gets value-initialized declarations and `dataLen = sizeof(MsprofTensorInfo)` in both blocks. A source with exactly two correctly initialized TensorInfo blocks is passed through unchanged; partial or unknown TensorInfo layouts fail closed. CompactInfo `dataLen` and `opFlag` repairs are counted separately from TensorInfo replacements. Per-call `replacement_count` and manifest `replacement_total` continue to count only TensorInfo changes; `compact_replacement_count` and `compact_replacement_total` count CompactInfo blocks changed. `repair_activated` is true only when either repair total is positive, so a factory call alone does not establish activation. For CompactInfo, the recognized block shape can be repaired when either or both supported fields are missing, and only missing fields are added; unknown, conflicting, or conditional block layouts fail closed. Other fields and report calls pass through unchanged, and there is no operator-name selector.
 
-The CPU-only contract tests use fake registered backends and do not need Triton, CANN, or an NPU. From `kernel_hook/`, run:
+The Python CPU contract tests use fake registered backends and do not need Triton, CANN, or an NPU. From `kernel_hook/`, run:
 
 ```bash
 python3 test/test_triton_tensorinfo_overlay.py
 ```
+
+The CompactInfo SDK probe compiles captured local and physical source excerpts against the actual CANN SDK header, then calls the original report path through a CPU stub. It checks SDK field layout and report arguments without requiring an NPU or CANN runtime library. Point it at the SDK directory containing `profiling/aprof_pub.h`:
+
+```bash
+python3 test/test_compact_header_contract.py \
+  --cxx /usr/bin/g++ \
+  --sdk-include-dir /root/miniconda3/envs/cann910/Ascend/cann-9.1.0/include/experiment/msprof
+```
+
+To confirm that the probe detects the old producer, pass a baseline overlay snapshot with `--overlay-script`; the expected result is a failed CompactInfo contract check:
+
+```bash
+python3 test/test_compact_header_contract.py \
+  --cxx /usr/bin/g++ \
+  --sdk-include-dir /root/miniconda3/envs/cann910/Ascend/cann-9.1.0/include/experiment/msprof \
+  --overlay-script /path/to/baseline-kernel-hook/scripts/triton_tensorinfo_overlay.py
+```
+
+This CPU SDK probe checks SDK field layout, payload length, and preservation of the report call; it does not validate training behavior or numerical equivalence. Training results are recorded separately.
 
 ## Run through the Python proxy
 
@@ -42,4 +63,4 @@ The registered Ascend backend must be available in that process. When the script
 
 The SDK payload remains five tensor slots by eight dimensions, and the current Triton producer clips a report to that fixed capacity. This overlay retains those limits and does not add report packets or change the ABI. The KDA four-slot and DHU five-slot observations describe the slots already reported for those captures; they do not imply that every kernel argument is represented when a kernel has more than five tensors. Although CANN's Opbase producer can emit multiple five-slot reports under the same op and summary identifiers, the SDK does not define a generic merge guarantee and this hook appends reports as received.
 
-The change only initializes the two TensorInfo records. CompactInfo and context-info headers, dtype-index mapping, collector gates, and kernel report counts remain outside this repair. To disable it, restore the prior `KIMIK3_PYTHON` value or stop pointing it at this proxy; no installed package or persistent cache needs rollback.
+The SDK's five-slot/eight-dimension limits and the producer's current single-report behavior remain unchanged. Context-info headers, dtype-index mapping, collector gates, and kernel report counts remain outside this repair. To disable it, restore the prior `KIMIK3_PYTHON` value or stop pointing it at this proxy; no installed package or persistent cache needs rollback. The native factory sees the transformed wrapper source, so its normal source-derived cache identity applies while existing cache entries remain untouched.

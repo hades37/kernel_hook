@@ -109,7 +109,17 @@ output_num,output_formats,output_dtypes,output_shapes
 
 SDK 单包最多包含 5 个 tensor slot、每个 shape 最多 8 个维度；当前 Triton producer 只发一个包，超出容量会截断。
 SDK shape 数组未携带 rank，零长度维度与填充零无法无损区分；CSV 还会省略零项。raw JSON 保留八个原值，但不据此推断完整 rank。
-TensorInfo producer 修复需通过 [proxy 或 CLI overlay](docs/triton_tensorinfo_producer.md) 启用；仅用 `LD_PRELOAD` 加载 hook 不会修改 producer。
+Triton producer overlay 通过 [proxy 或 CLI overlay](docs/triton_tensorinfo_producer.md) 启用：它初始化 TensorInfo 长度，并修复受支持 CompactInfo 的 `dataLen = sizeof(MsprofNodeBasicInfo)` 和缺省 AIV `opFlag = 0`。已识别但缺少一个或两个字段的 CompactInfo 只补缺项；未知、冲突或带条件控制流的布局会拒绝修补。CompactInfo 的 report 长度仍为 `sizeof(MsprofCompactInfo)`；仅用 `LD_PRELOAD` 加载 hook 不会修改 producer，SDK ABI、安装的 driver 和 cache 实现也不变。
+
+有 CANN SDK 头文件和 C++ 编译器时，可在 CPU 环境运行 CompactInfo producer 合约检查；无需 NPU 或 CANN 运行时库：
+
+```bash
+python3 test/test_compact_header_contract.py \
+  --cxx /usr/bin/g++ \
+  --sdk-include-dir /root/miniconda3/envs/cann910/Ascend/cann-9.1.0/include/experiment/msprof
+```
+
+`--sdk-include-dir` 指向包含 `profiling/aprof_pub.h` 的 SDK 目录。要诊断旧实现，可额外传入 `--overlay-script /path/to/baseline-kernel-hook/scripts/triton_tensorinfo_overlay.py`；旧 overlay 预期无法满足 CompactInfo field contract。详见上方 producer 文档中的边界与审计计数说明。
 
 ### dtype 标签
 
