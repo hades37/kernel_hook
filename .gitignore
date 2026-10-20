@@ -3,6 +3,7 @@ build/
 *.o
 *.so
 *.a
+__pycache__/
 
 # generated hook outputs
 out_*/
