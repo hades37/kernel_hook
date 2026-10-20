@@ -29,6 +29,214 @@ INITIALIZED_BLOCK = re.compile(
     r"(?P=indent)tensorInfo\.dataLen[ \t]*=[ \t]*sizeof\(MsprofTensorInfo\);[ \t]*\r?$"
 )
 TENSOR_DATA_LEN_ASSIGNMENT = re.compile(r"(?m)^[ \t]*tensorInfo\.dataLen[ \t]*=")
+COMPACT_DECLARATION = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)MsprofCompactInfo[ \t]+"
+    r"(?P<name>[A-Za-z_]\w*)(?P<initializer>\{\})?;[ \t]*(?=\r?$)"
+)
+COMPACT_REPORT_CALL = re.compile(r"\bMsprofReportCompactInfo\s*\(")
+COMPACT_TYPE_REFERENCE = re.compile(r"\bMsprofCompactInfo\b")
+
+
+def _compact_report_pattern(name: str) -> re.Pattern[str]:
+    escaped_name = re.escape(name)
+    return re.compile(
+        rf"\bMsprofReportCompactInfo\s*\(\s*[^,\r\n]+,\s*"
+        rf"static_cast\s*<\s*void\s*\*>\s*\(\s*&\s*{escaped_name}\s*\)\s*,\s*"
+        rf"sizeof\s*\(\s*MsprofCompactInfo\s*\)\s*\)\s*;"
+    )
+
+
+def _compact_member_assignment(
+    name: str, member: str, rhs_name: str = "rhs"
+) -> re.Pattern[str]:
+    escaped_name = re.escape(name)
+    if member == "dataLen":
+        field = rf"{escaped_name}\.dataLen"
+    elif member == "opFlag":
+        field = rf"{escaped_name}\.data\.nodeBasicInfo\.opFlag"
+    else:
+        raise ValueError(f"unsupported CompactInfo member: {member}")
+    return re.compile(rf"\b{field}\s*=\s*(?P<{rhs_name}>[^;\r\n]+?)\s*;")
+
+
+def _recognized_simple_value(value: str) -> bool:
+    value = value.strip()
+    integer_literal = re.fullmatch(
+        r"(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)"
+        r"(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?",
+        value,
+    )
+    simple_symbol = re.fullmatch(r"[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*", value)
+    return integer_literal is not None or simple_symbol is not None
+
+
+COMPACT_SIMPLE_ASSIGNMENT = re.compile(
+    r"(?P<name>[A-Za-z_]\w*)\.(?P<field>level|magicNumber|type|threadId|timeStamp|"
+    r"dataLen|data\.nodeBasicInfo\.(?:opName|opType|taskType|blockDim|opFlag))"
+    r"\s*=\s*(?P<rhs>[^;\r\n]+?)\s*;\s*(?://.*)?"
+)
+
+
+def _validate_compact_block(block: str, name: str) -> None:
+    declaration_pattern = re.compile(
+        rf"MsprofCompactInfo\s+{re.escape(name)}(?:\{{\}})?;"
+    )
+    report_pattern = _compact_report_pattern(name)
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if declaration_pattern.fullmatch(stripped) or report_pattern.fullmatch(stripped):
+            continue
+        assignment = COMPACT_SIMPLE_ASSIGNMENT.fullmatch(stripped)
+        if (
+            assignment is not None
+            and assignment.group("name") == name
+            and assignment.group("field") == "dataLen"
+        ):
+            rhs = assignment.group("rhs").strip()
+            if re.fullmatch(r"sizeof\s*\(\s*MsprofNodeBasicInfo\s*\)", rhs):
+                continue
+        if (
+            assignment is None
+            or assignment.group("name") != name
+            or not _recognized_simple_value(assignment.group("rhs"))
+        ):
+            raise ValueError(
+                f"CompactInfo {name!r} contains an unsupported statement or control-flow shape"
+            )
+
+
+def _patch_compact_info_source(source: str) -> tuple[str, int]:
+    declarations = list(COMPACT_DECLARATION.finditer(source))
+    report_calls = list(COMPACT_REPORT_CALL.finditer(source))
+    type_references = list(COMPACT_TYPE_REFERENCE.finditer(source))
+
+    if not declarations:
+        if report_calls or type_references:
+            raise ValueError(
+                "launcher wrapper contains an unsupported CompactInfo declaration/report shape"
+            )
+        return source, 0
+
+    if len(declarations) != 2 or any(
+        declaration.group("name") != "nodeBasicInfo" for declaration in declarations
+    ):
+        raise ValueError("launcher wrapper must contain exactly two nodeBasicInfo blocks")
+
+    if len(report_calls) != 2:
+        raise ValueError(
+            "each CompactInfo declaration must have exactly one supported report call"
+        )
+
+    additions: list[tuple[int, str]] = []
+    covered_type_references: list[tuple[int, int]] = []
+    replacement_count = 0
+
+    for index, declaration in enumerate(declarations):
+        name = declaration.group("name")
+        next_declaration_start = (
+            declarations[index + 1].start()
+            if index + 1 < len(declarations)
+            else len(source)
+        )
+        calls_in_block = [
+            call
+            for call in report_calls
+            if declaration.end() <= call.start() < next_declaration_start
+        ]
+        if len(calls_in_block) != 1:
+            raise ValueError(
+                f"CompactInfo declaration {name!r} has an unknown report boundary"
+            )
+
+        report = calls_in_block[0]
+        report_match = _compact_report_pattern(name).match(source, report.start())
+        if report_match is None or report_match.end() > next_declaration_start:
+            raise ValueError(
+                f"CompactInfo declaration {name!r} has an unsupported report call"
+            )
+
+        block_start = declaration.start()
+        block_end = report_match.end()
+        block = source[block_start:block_end]
+        _validate_compact_block(block, name)
+        covered_type_references.extend(
+            (match.start(), match.end())
+            for match in type_references
+            if block_start <= match.start() < block_end
+        )
+
+        data_len_reference = re.compile(rf"\b{re.escape(name)}\.dataLen\b")
+        data_len_references = list(data_len_reference.finditer(block))
+        data_len_assignments = list(_compact_member_assignment(name, "dataLen").finditer(block))
+        if len(data_len_references) != len(data_len_assignments) or len(data_len_assignments) > 1:
+            raise ValueError(f"CompactInfo {name!r} has an unknown or duplicate dataLen assignment")
+
+        needs_data_len = not data_len_assignments
+        if data_len_assignments and not re.fullmatch(
+            r"sizeof\s*\(\s*MsprofNodeBasicInfo\s*\)",
+            data_len_assignments[0].group("rhs").strip(),
+        ):
+            raise ValueError(f"CompactInfo {name!r} has a conflicting dataLen assignment")
+
+        op_flag_reference = re.compile(
+            rf"\b{re.escape(name)}\.data\.nodeBasicInfo\.opFlag\b"
+        )
+        op_flag_references = list(op_flag_reference.finditer(block))
+        op_flag_assignments = list(_compact_member_assignment(name, "opFlag").finditer(block))
+        if len(op_flag_references) != len(op_flag_assignments) or len(op_flag_assignments) > 1:
+            raise ValueError(f"CompactInfo {name!r} has an unknown or duplicate opFlag assignment")
+
+        needs_op_flag = not op_flag_assignments
+        if op_flag_assignments and not _recognized_simple_value(
+            op_flag_assignments[0].group("rhs")
+        ):
+            raise ValueError(f"CompactInfo {name!r} has an unrecognized opFlag assignment")
+
+        if needs_op_flag:
+            mode_or_exec_mode = re.compile(
+                rf"\b{re.escape(name)}\.data\.nodeBasicInfo\.(?:mode|execMode)\b"
+            )
+            task_type_reference = re.compile(
+                rf"\b{re.escape(name)}\.data\.nodeBasicInfo\.taskType\b"
+            )
+            task_type_assignment = re.compile(
+                rf"\b{re.escape(name)}\.data\.nodeBasicInfo\.taskType\s*=\s*"
+                r"(?P<rhs>[^;\r\n]+?)\s*;"
+            )
+            task_type_assignments = list(task_type_assignment.finditer(block))
+            if (
+                mode_or_exec_mode.search(block)
+                or len(list(task_type_reference.finditer(block))) != 1
+                or len(task_type_assignments) != 1
+                or task_type_assignments[0].group("rhs").strip()
+                != "MSPROF_GE_TASK_TYPE_AIV"
+            ):
+                raise ValueError(
+                    f"CompactInfo {name!r} needs an explicit opFlag outside the exact AIV template"
+                )
+
+        assignments: list[str] = []
+        if needs_data_len:
+            assignments.append(f"{name}.dataLen = sizeof(MsprofNodeBasicInfo);")
+        if needs_op_flag:
+            assignments.append(f"{name}.data.nodeBasicInfo.opFlag = 0;")
+        if assignments:
+            line_ending = "\r\n" if source.startswith("\r\n", declaration.end()) else "\n"
+            insertion = line_ending + line_ending.join(
+                f"{declaration.group('indent')}{assignment}" for assignment in assignments
+            )
+            additions.append((declaration.end(), insertion))
+            replacement_count += 1
+
+    for reference in type_references:
+        if not any(start <= reference.start() < end for start, end in covered_type_references):
+            raise ValueError("launcher wrapper contains an unsupported CompactInfo type use")
+
+    for position, insertion in reversed(additions):
+        source = source[:position] + insertion + source[position:]
+    return source, replacement_count
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -39,7 +247,7 @@ def sha256_text(value: str) -> str:
     return sha256_bytes(value.encode("utf-8"))
 
 
-def _patch_wrapper_source(source: str) -> tuple[str, int]:
+def _patch_wrapper_source(source: str) -> tuple[str, int, int]:
     if not isinstance(source, str):
         raise TypeError("generated launcher wrapper source must be a string")
 
@@ -57,24 +265,27 @@ def _patch_wrapper_source(source: str) -> tuple[str, int]:
                 f"{indent}tensorInfo.dataLen = sizeof(MsprofTensorInfo);"
             )
 
-        return RAW_DECLARATION.sub(initialize, source), 2
+        tensor_source, tensor_replacement_count = RAW_DECLARATION.subn(initialize, source)
 
-    if (
+    elif (
         raw_count == 0
         and initialized_count == 2
         and initialized_block_count == 2
         and data_len_count == 2
     ):
-        return source, 0
+        tensor_source, tensor_replacement_count = source, 0
+    else:
+        raise ValueError(
+            "launcher wrapper must contain exactly two uninitialized TensorInfo blocks "
+            "or exactly two correctly initialized blocks; refusing partial/unknown source"
+        )
 
-    raise ValueError(
-        "launcher wrapper must contain exactly two uninitialized TensorInfo blocks "
-        "or exactly two correctly initialized blocks; refusing partial/unknown source"
-    )
+    effective_source, compact_replacement_count = _patch_compact_info_source(tensor_source)
+    return effective_source, tensor_replacement_count, compact_replacement_count
 
 
 def patch_wrapper_source(source: str) -> str:
-    """Initialize both generated TensorInfo records, leaving all other C++ intact."""
+    """Initialize TensorInfo and supported CompactInfo metadata, preserving other C++."""
     return _patch_wrapper_source(source)[0]
 
 
@@ -240,6 +451,7 @@ def install_factory_patch(
             "return_status": "error",
             "error_stage": "source_validation",
             "replacement_count": None,
+            "compact_replacement_count": None,
             "original_cache_key": None,
             "effective_cache_key": None,
             "effective_cpp_sha256": None,
@@ -257,7 +469,9 @@ def install_factory_patch(
             original_src = _argument_value(signature, args, kwargs, "wrapper_src")
             if not isinstance(header_src, str) or not isinstance(original_src, str):
                 raise TypeError("launcher source arguments must be strings")
-            effective_src, replacement_count = _patch_wrapper_source(original_src)
+            effective_src, replacement_count, compact_replacement_count = _patch_wrapper_source(
+                original_src
+            )
             forwarded_args, forwarded_kwargs = _replace_argument(
                 signature, args, kwargs, "wrapper_src", effective_src
             )
@@ -272,6 +486,7 @@ def install_factory_patch(
                 "original_cpp_sha256": sha256_text(original_src),
                 "effective_cpp_sha256": sha256_text(effective_src),
                 "replacement_count": replacement_count,
+                "compact_replacement_count": compact_replacement_count,
                 "original_cache_key": original_key,
                 "effective_cache_key": effective_key,
                 "return_status": "running",
@@ -368,6 +583,7 @@ class AuditWriter:
         self.success_count = 0
         self.error_count = 0
         self.replacement_total = 0
+        self.compact_replacement_total = 0
 
     def __call__(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, sort_keys=True, default=str)
@@ -381,6 +597,9 @@ class AuditWriter:
             elif record.get("return_status") == "error":
                 self.error_count += 1
             self.replacement_total += int(record.get("replacement_count", 0) or 0)
+            self.compact_replacement_total += int(
+                record.get("compact_replacement_count", 0) or 0
+            )
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -389,6 +608,7 @@ class AuditWriter:
                 "launcher_successes": self.success_count,
                 "launcher_errors": self.error_count,
                 "replacement_total": self.replacement_total,
+                "compact_replacement_total": self.compact_replacement_total,
             }
 
 
@@ -539,9 +759,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest.update(audit_writer.snapshot())
         if manifest.get("exit_code") == 0 and audit_writer.call_count == 0:
             manifest["run_status"] = "no_launcher_calls"
-            manifest["repair_activated"] = False
-        elif audit_writer.call_count > 0:
-            manifest["repair_activated"] = True
+        manifest["repair_activated"] = bool(
+            manifest.get("replacement_total", 0) > 0
+            or manifest.get("compact_replacement_total", 0) > 0
+        )
         manifest["factory_restored"] = (
             guard.namespace.get(FACTORY_NAME) is guard.original if guard is not None else None
         )

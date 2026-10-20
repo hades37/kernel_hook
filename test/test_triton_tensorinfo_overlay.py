@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -96,11 +97,15 @@ class RecordingFactory:
         return self.result
 
 
-def make_registered_backend(module_name: str):
+def make_registered_backend(
+    module_name: str, wrapper_sources: dict[str, str] | None = None
+):
     """Build a registry driver whose methods resolve globals in one namespace."""
     factory_calls: list[dict[str, object]] = []
 
     def source_builder(template: str) -> str:
+        if wrapper_sources is not None and template in wrapper_sources:
+            return wrapper_sources[template]
         return raw_wrapper_source(template)
 
     namespace: dict[str, object] = {
@@ -155,6 +160,79 @@ class NPUDriver:
     assert launcher_class._make_launcher_stub_path.__globals__ is namespace
     registry = {"ascend": types.SimpleNamespace(driver=driver_class)}
     return namespace, registry, factory_calls
+
+
+def saved_generated_wrapper_sources() -> dict[str, str]:
+    fixture_dir = Path(__file__).parent
+    return {
+        "local-generate_npu_wrapper_src": (
+            fixture_dir / "triton_launcher_local_compact_excerpt.cxx"
+        ).read_text(encoding="utf-8"),
+        "physical-make_launcher": (
+            fixture_dir / "triton_launcher_physical_compact_excerpt.cxx"
+        ).read_text(encoding="utf-8"),
+    }
+
+
+COMPACT_REPORT = (
+    "MsprofReportCompactInfo(0, static_cast<void *>(&nodeBasicInfo), "
+    "sizeof(MsprofCompactInfo));"
+)
+COMPACT_REPORT_BLOCK = re.compile(
+    r"MsprofCompactInfo nodeBasicInfo(?:\{\})?;"
+    r"(?P<body>.*?MsprofReportCompactInfo\(0,\s*static_cast<void\s*\*>"
+    r"\(&nodeBasicInfo\),\s*sizeof\(MsprofCompactInfo\)\);)",
+    re.DOTALL,
+)
+
+
+def compact_report_blocks(source: str) -> list[str]:
+    return [match.group(0) for match in COMPACT_REPORT_BLOCK.finditer(source)]
+
+
+def source_with_explicit_hf32_compact_flags(source: str) -> str:
+    assignment = (
+        "      nodeBasicInfo.dataLen = sizeof(MsprofNodeBasicInfo);\n"
+        "      nodeBasicInfo.data.nodeBasicInfo.opFlag = 1;\n"
+    )
+    if source.count(COMPACT_REPORT) != 2:
+        raise AssertionError("expected two captured CompactInfo report sites")
+    return source.replace(COMPACT_REPORT, assignment + COMPACT_REPORT)
+
+
+def assert_default_compact_metadata(test_case: unittest.TestCase, source: str) -> None:
+    blocks = compact_report_blocks(source)
+    test_case.assertEqual(len(blocks), 2)
+    for block in blocks:
+        test_case.assertEqual(
+            len(
+                re.findall(
+                    r"nodeBasicInfo\.dataLen\s*=\s*"
+                    r"sizeof\(MsprofNodeBasicInfo\)\s*;",
+                    block,
+                )
+            ),
+            1,
+        )
+        test_case.assertEqual(
+            len(
+                re.findall(
+                    r"nodeBasicInfo\.data\.nodeBasicInfo\.opFlag\s*=\s*0U?\s*;",
+                    block,
+                )
+            ),
+            1,
+        )
+
+
+def remove_default_compact_metadata(source: str) -> str:
+    return re.sub(
+        r"(?m)^[ \t]*(?P<name>[A-Za-z_]\w*)\.dataLen\s*=\s*"
+        r"sizeof\(MsprofNodeBasicInfo\);\r?\n"
+        r"^[ \t]*(?P=name)\.data\.nodeBasicInfo\.opFlag\s*=\s*0;\r?\n",
+        "",
+        source,
+    )
 
 
 class PatchWrapperSourceTests(unittest.TestCase):
@@ -318,6 +396,272 @@ class FactoryPatchTests(unittest.TestCase):
         self.assertEqual(len(results), call_count)
         call_numbers = [record["call"] for record in audit_records]
         self.assertEqual(sorted(call_numbers), list(range(1, call_count + 1)))
+
+
+class CapturedCompactInfoFactoryTests(unittest.TestCase):
+    def test_saved_local_and_physical_templates_get_defaults_through_registry_factory(self) -> None:
+        sources = saved_generated_wrapper_sources()
+        for source in sources.values():
+            self.assertEqual(source.count(COMPACT_REPORT), 2)
+            self.assertNotIn("nodeBasicInfo.dataLen =", source)
+            self.assertNotIn("nodeBasicInfo.data.nodeBasicInfo.opFlag =", source)
+
+        for module_name in ("ascend", "triton.backends.ascend.driver"):
+            namespace, registry, factory_calls = make_registered_backend(
+                module_name, wrapper_sources=sources
+            )
+            original_factory = namespace["make_npu_launcher_stub"]
+            audit_records: list[dict[str, object]] = []
+
+            with overlay.install_registered_backend_patch(
+                registry, audit_callback=audit_records.append
+            ):
+                launcher_class = namespace["NPULauncher"]
+                for entrypoint in (
+                    "generate_npu_wrapper_src",
+                    "make_launcher",
+                ):
+                    with self.subTest(module_name=module_name, entrypoint=entrypoint):
+                        template_source = sources[
+                            "local-generate_npu_wrapper_src"
+                            if entrypoint == "generate_npu_wrapper_src"
+                            else "physical-make_launcher"
+                        ]
+                        launcher = object.__new__(launcher_class)
+                        launcher.template_entrypoint = entrypoint
+                        launcher.debug = False
+                        launcher._make_launcher_stub_path()
+
+                        forwarded_source = factory_calls[-1]["wrapper_src"]
+                        assert isinstance(forwarded_source, str)
+                        assert_default_compact_metadata(self, forwarded_source)
+                        self.assertEqual(
+                            remove_default_compact_metadata(forwarded_source),
+                            expected_initialized_source(template_source),
+                        )
+                        self.assertEqual(
+                            overlay.patch_wrapper_source(forwarded_source),
+                            forwarded_source,
+                        )
+                        reparsed_source, tensor_count, compact_count = (
+                            overlay._patch_wrapper_source(forwarded_source)
+                        )
+                        self.assertEqual(reparsed_source, forwarded_source)
+                        self.assertEqual(tensor_count, 0)
+                        self.assertEqual(compact_count, 0)
+                        self.assertEqual(
+                            forwarded_source.count("MsprofCompactInfo nodeBasicInfo;"), 2
+                        )
+                        self.assertNotIn("MsprofCompactInfo nodeBasicInfo{};", forwarded_source)
+                        self.assertEqual(forwarded_source.count(COMPACT_REPORT), 2)
+                        self.assertEqual(
+                            forwarded_source.count("MsprofReportAdditionalInfo("), 2
+                        )
+                        self.assertLess(
+                            forwarded_source.index(COMPACT_REPORT),
+                            forwarded_source.index("MsprofReportAdditionalInfo("),
+                        )
+                        self.assertEqual(audit_records[-1]["replacement_count"], 2)
+                        self.assertEqual(
+                            audit_records[-1]["compact_replacement_count"], 2
+                        )
+
+            self.assertIs(namespace["make_npu_launcher_stub"], original_factory)
+            self.assertEqual(len(factory_calls), 2)
+
+    def test_existing_hf32_compact_flags_are_preserved_or_rejected_before_factory(self) -> None:
+        source = source_with_explicit_hf32_compact_flags(
+            saved_generated_wrapper_sources()["local-generate_npu_wrapper_src"]
+        )
+        namespace, registry, factory_calls = make_registered_backend(
+            "triton.backends.ascend.driver",
+            wrapper_sources={"local-generate_npu_wrapper_src": source},
+        )
+        original_factory = namespace["make_npu_launcher_stub"]
+
+        with overlay.install_registered_backend_patch(registry):
+            launcher_class = namespace["NPULauncher"]
+            launcher = object.__new__(launcher_class)
+            launcher.template_entrypoint = "generate_npu_wrapper_src"
+            launcher.debug = False
+            try:
+                launcher._make_launcher_stub_path()
+            except (RuntimeError, ValueError):
+                self.assertEqual(factory_calls, [])
+            else:
+                self.assertEqual(len(factory_calls), 1)
+                forwarded_source = factory_calls[0]["wrapper_src"]
+                assert isinstance(forwarded_source, str)
+                blocks = compact_report_blocks(forwarded_source)
+                self.assertEqual(len(blocks), 2)
+                for block in blocks:
+                    flags = re.findall(
+                        r"nodeBasicInfo\.data\.nodeBasicInfo\.opFlag\s*=\s*([^;]+);",
+                        block,
+                    )
+                    self.assertEqual(flags, ["1"])
+                    self.assertRegex(
+                        block,
+                        r"nodeBasicInfo\.dataLen\s*=\s*"
+                        r"sizeof\(MsprofNodeBasicInfo\)\s*;",
+                    )
+
+        self.assertIs(namespace["make_npu_launcher_stub"], original_factory)
+
+    def test_one_correct_compact_block_is_preserved_while_the_other_is_repaired(self) -> None:
+        source = saved_generated_wrapper_sources()["local-generate_npu_wrapper_src"]
+        fixed_block = (
+            "      nodeBasicInfo.dataLen = sizeof(MsprofNodeBasicInfo);\n"
+            "      nodeBasicInfo.data.nodeBasicInfo.opFlag = MSPROF_GE_OP_FLAG_HF32;\n"
+        )
+        partial_source = source.replace(COMPACT_REPORT, fixed_block + COMPACT_REPORT, 1)
+        namespace, registry, factory_calls = make_registered_backend(
+            "triton.backends.ascend.driver",
+            wrapper_sources={"local-generate_npu_wrapper_src": partial_source},
+        )
+        audit_records: list[dict[str, object]] = []
+
+        with overlay.install_registered_backend_patch(
+            registry, audit_callback=audit_records.append
+        ):
+            launcher_class = namespace["NPULauncher"]
+            launcher = object.__new__(launcher_class)
+            launcher.template_entrypoint = "generate_npu_wrapper_src"
+            launcher.debug = False
+            launcher._make_launcher_stub_path()
+
+        forwarded_source = factory_calls[0]["wrapper_src"]
+        assert isinstance(forwarded_source, str)
+        blocks = compact_report_blocks(forwarded_source)
+        self.assertEqual(len(blocks), 2)
+        self.assertRegex(blocks[0], r"opFlag\s*=\s*MSPROF_GE_OP_FLAG_HF32\s*;")
+        self.assertRegex(blocks[1], r"opFlag\s*=\s*0\s*;")
+        self.assertEqual(audit_records[0]["replacement_count"], 2)
+        self.assertEqual(audit_records[0]["compact_replacement_count"], 1)
+
+    def test_conflicting_unknown_or_non_aiv_compact_shapes_fail_closed(self) -> None:
+        source = saved_generated_wrapper_sources()["local-generate_npu_wrapper_src"]
+        compact_blocks = list(COMPACT_REPORT_BLOCK.finditer(source))
+        self.assertEqual(len(compact_blocks), 2)
+        bad_sources = {
+            "conflicting-data-len": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.dataLen = 1;\n" + COMPACT_REPORT,
+                1,
+            ),
+            "duplicate-data-len": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.dataLen = sizeof(MsprofNodeBasicInfo);\n"
+                "      nodeBasicInfo.dataLen = sizeof(MsprofNodeBasicInfo);\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "duplicate-op-flag": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.data.nodeBasicInfo.opFlag = 0;\n"
+                "      nodeBasicInfo.data.nodeBasicInfo.opFlag = 1;\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "unknown-op-flag-expression": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.data.nodeBasicInfo.opFlag = get_op_flag();\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "non-aiv-without-op-flag": source.replace(
+                "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AIV;",
+                "nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AICORE;",
+                1,
+            ),
+            "exec-mode-without-op-flag": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.data.nodeBasicInfo.execMode = 0;\n" + COMPACT_REPORT,
+                1,
+            ),
+            "conditioned-data-len": source.replace(
+                COMPACT_REPORT,
+                "      if (should_set_length) nodeBasicInfo.dataLen = "
+                "sizeof(MsprofNodeBasicInfo);\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "conditioned-op-flag": source.replace(
+                COMPACT_REPORT,
+                "      if (use_hf32) nodeBasicInfo.data.nodeBasicInfo.opFlag = 1;\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "whole-payload-overwrite": source.replace(
+                COMPACT_REPORT,
+                "      nodeBasicInfo.data = payload;\n" + COMPACT_REPORT,
+                1,
+            ),
+            "payload-alias": source.replace(
+                COMPACT_REPORT,
+                "      auto &payload = nodeBasicInfo.data.nodeBasicInfo;\n"
+                + COMPACT_REPORT,
+                1,
+            ),
+            "exec-mode-alias": source.replace(
+                COMPACT_REPORT,
+                "      auto execMode = get_exec_mode();\n" + COMPACT_REPORT,
+                1,
+            ),
+            "unsupported-report-cast": source.replace(
+                "static_cast<void *>(&nodeBasicInfo)",
+                "reinterpret_cast<void *>(&nodeBasicInfo)",
+                1,
+            ),
+            "duplicate-report": source.replace(
+                COMPACT_REPORT,
+                COMPACT_REPORT + "\n      " + COMPACT_REPORT,
+                1,
+            ),
+            "one-compact-block": (
+                source[: compact_blocks[1].start()]
+                + source[compact_blocks[1].end() :]
+            ),
+            "three-compact-blocks": (
+                source + "\n" + compact_blocks[0].group(0) + "\n"
+            ),
+            "unknown-extra-declaration": source + "\nMsprofCompactInfo unreported;\n",
+        }
+        for name, bad_source in bad_sources.items():
+            with self.subTest(shape=name):
+                with self.assertRaises(ValueError):
+                    overlay.patch_wrapper_source(bad_source)
+
+    def test_tensor_and_compact_replacement_totals_remain_independent(self) -> None:
+        source = saved_generated_wrapper_sources()["local-generate_npu_wrapper_src"]
+        tensor_only_fixed_source = expected_initialized_source(source)
+        factory_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def native_factory(header_src, wrapper_src, debug=False):
+            factory_calls.append(((header_src, wrapper_src, debug), {}))
+            return "native-result"
+
+        with tempfile.TemporaryDirectory(prefix="compact audit ") as temporary:
+            writer = overlay.AuditWriter(Path(temporary))
+            namespace = {"make_npu_launcher_stub": native_factory}
+            with overlay.install_factory_patch(namespace, audit_callback=writer):
+                namespace["make_npu_launcher_stub"](HEADER_SRC, source, False)
+                namespace["make_npu_launcher_stub"](
+                    HEADER_SRC, tensor_only_fixed_source, False
+                )
+
+            records = [
+                json.loads(line)
+                for line in writer.calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["replacement_count"] for record in records], [2, 0])
+            self.assertEqual(
+                [record["compact_replacement_count"] for record in records], [2, 2]
+            )
+            snapshot = writer.snapshot()
+            self.assertEqual(snapshot["replacement_total"], 2)
+            self.assertEqual(snapshot["compact_replacement_total"], 4)
+            self.assertEqual(len(factory_calls), 2)
 
 
 class RegisteredBackendTests(unittest.TestCase):
