@@ -122,6 +122,28 @@ python3 test/test_dtype_contract.py --sdk-include-dir /path/to/cann/x86_64-linux
 `ASCEND_HOME_PATH`、`ASCEND_TOOLKIT_HOME`、`CANN_HOME` 或 `ASCEND_HOME` 配置 SDK，也可直接运行
 `python3 test/test_dtype_contract.py`。
 
+### format 标签
+
+`input_formats` 和 `output_formats` 的主格式标签按 CANN 9.1 SDK 公共头文件
+`graph/c_types.h` 中的 `C_Format`（`C_FORMAT_*`）枚举生成。低 8 位是主格式，和 SDK 的
+`GetPrimaryFormat(format)` 一致；例如 HWCN 是 `16`、NDHWC 是 `27`、FRACTAL_NZ 是 `29`。
+有效枚举标签去掉 `C_FORMAT_` 前缀输出，包括 `ALL`、`NULL` 等具名项。
+
+`C_FORMAT_RESERVED`（`40`）、`C_FORMAT_END`（`55`）、`C_FORMAT_MAX`（`255`）是保留值或范围
+边界，输出 `UNKNOWN`；其他未识别主格式也输出 `UNKNOWN`。当 format 含有高位子格式或 C0 信息时，
+CSV 只显示低 8 位主格式；`raw_reports.jsonl` 中的 `format` 保留完整原始数字，例如 packed format
+仍可从 raw 记录中检查高位信息。
+
+可在有 CANN SDK 头文件和 C++ 编译器的 CPU 环境运行格式契约检查；无需 NPU 或 CANN 运行时库：
+
+```bash
+python3 test/test_format_contract.py --sdk-include-dir /path/to/cann/x86_64-linux/include
+```
+
+该 include 目录需包含 `graph/c_types.h`。若已通过环境变量
+`ASCEND_HOME_PATH`、`ASCEND_TOOLKIT_HOME`、`CANN_HOME` 或 `ASCEND_HOME` 配置 SDK，也可直接运行
+`python3 test/test_format_contract.py`。
+
 ### `launch.csv`
 
 ```

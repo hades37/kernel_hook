@@ -242,12 +242,13 @@ def compile_one(command: list[str], cwd: Path) -> None:
         )
 
 
-def build_artifacts(work: Path, cxx: str, sdk_include: Path) -> tuple[Path, Path, Path]:
+def build_artifacts(work: Path, cxx: str, sdk_include: Path,
+                    probe_source: str = PROBE_SOURCE) -> tuple[Path, Path, Path]:
     fake_library = work / "libdtype_fake_msprof_api.so"
     hook_library = work / "libmsprof_hook_dtype_contract.so"
-    probe_source = work / "dtype_contract_probe.cpp"
+    probe_file = work / "contract_probe.cpp"
     probe = work / "dtype_contract_probe"
-    probe_source.write_text(PROBE_SOURCE, encoding="utf-8")
+    probe_file.write_text(probe_source, encoding="utf-8")
 
     compile_one([
         cxx, "-std=c++11", "-Wall", "-Wextra", "-fPIC", "-shared",
@@ -259,7 +260,7 @@ def build_artifacts(work: Path, cxx: str, sdk_include: Path) -> tuple[Path, Path
     ], work)
     compile_one([
         cxx, "-std=c++11", "-Wall", "-Wextra", f"-I{INCLUDE}", f"-I{sdk_include}",
-        str(probe_source), f"-L{work}", f"-Wl,-rpath,{work}", "-ldtype_fake_msprof_api",
+        str(probe_file), f"-L{work}", f"-Wl,-rpath,{work}", "-ldtype_fake_msprof_api",
         "-o", str(probe),
     ], work)
     return hook_library, fake_library, probe

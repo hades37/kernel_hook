@@ -73,23 +73,63 @@ std::string CsvEscape(const std::string &s)
 
 const char *FormatName(uint32_t format)
 {
+    // Msprof tensor format carries ge::Format. Its primary format is the low
+    // byte; ACL uses matching numeric codes for its overlapping formats.
     switch (format & 0xFFU) {
         case 0: return "NCHW";
         case 1: return "NHWC";
         case 2: return "ND";
         case 3: return "NC1HWC0";
         case 4: return "FRACTAL_Z";
-        case 5: return "NC1HWC0_C04";
-        case 6: return "HWCN";
-        case 7: return "NDHWC";
-        case 8: return "NCDHW";
-        case 9: return "DHWCN";
-        case 10: return "NDC1HWC0";
-        case 11: return "FRACTAL_Z_3D";
-        case 12: return "NC";
-        case 13: return "NCL";
-        case 14: return "NCHW_ALIGN";
+        case 5: return "NC1C0HWPAD";
+        case 6: return "NHWC1C0";
+        case 7: return "FSR_NCHW";
+        case 8: return "FRACTAL_DECONV";
+        case 9: return "C1HWNC0";
+        case 10: return "FRACTAL_DECONV_TRANSPOSE";
+        case 11: return "FRACTAL_DECONV_SP_STRIDE_TRANS";
+        case 12: return "NC1HWC0_C04";
+        case 13: return "FRACTAL_Z_C04";
+        case 14: return "CHWN";
+        case 15: return "FRACTAL_DECONV_SP_STRIDE8_TRANS";
+        case 16: return "HWCN";
+        case 17: return "NC1KHKWHWC0";
+        case 18: return "BN_WEIGHT";
+        case 19: return "FILTER_HWCK";
+        case 20: return "HASHTABLE_LOOKUP_LOOKUPS";
+        case 21: return "HASHTABLE_LOOKUP_KEYS";
+        case 22: return "HASHTABLE_LOOKUP_VALUE";
+        case 23: return "HASHTABLE_LOOKUP_OUTPUT";
+        case 24: return "HASHTABLE_LOOKUP_HITS";
+        case 25: return "C1HWNCoC0";
+        case 26: return "MD";
+        case 27: return "NDHWC";
+        case 28: return "FRACTAL_ZZ";
         case 29: return "FRACTAL_NZ";
+        case 30: return "NCDHW";
+        case 31: return "DHWCN";
+        case 32: return "NDC1HWC0";
+        case 33: return "FRACTAL_Z_3D";
+        case 34: return "CN";
+        case 35: return "NC";
+        case 36: return "DHWNC";
+        case 37: return "FRACTAL_Z_3D_TRANSPOSE";
+        case 38: return "FRACTAL_ZN_LSTM";
+        case 39: return "FRACTAL_Z_G";
+        case 41: return "ALL";
+        case 42: return "NULL";
+        case 43: return "ND_RNN_BIAS";
+        case 44: return "FRACTAL_ZN_RNN";
+        case 45: return "NYUV";
+        case 46: return "NYUV_A";
+        case 47: return "NCL";
+        case 48: return "FRACTAL_Z_WINO";
+        case 49: return "C1HWC0";
+        case 50: return "FRACTAL_NZ_C0_16";
+        case 51: return "FRACTAL_NZ_C0_32";
+        case 52: return "FRACTAL_NZ_C0_2";
+        case 53: return "FRACTAL_NZ_C0_4";
+        case 54: return "FRACTAL_NZ_C0_8";
         default: return "UNKNOWN";
     }
 }
