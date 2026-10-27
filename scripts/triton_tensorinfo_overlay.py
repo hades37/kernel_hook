@@ -43,6 +43,37 @@ COMPACT_DECLARATION = re.compile(
 )
 COMPACT_REPORT_CALL = re.compile(r"\bMsprofReportCompactInfo\s*\(")
 COMPACT_TYPE_REFERENCE = re.compile(r"\bMsprofCompactInfo\b")
+CONTEXT_INFO_DECLARATION = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)MsprofAdditionalInfo[ \t]+info"
+    r"(?P<initializer>[ \t]*\{\})?;[ \t]*\r?$"
+)
+CONTEXT_ID_DECLARATION = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)MsprofContextIdInfo[ \t]+ctxId"
+    r"(?P<initializer>[ \t]*\{\})?;[ \t]*\r?$"
+)
+CONTEXT_INFO_DECLARATION_REFERENCE = re.compile(
+    r"\bMsprofAdditionalInfo[ \t]+info\b"
+)
+CONTEXT_ID_DECLARATION_REFERENCE = re.compile(
+    r"\bMsprofContextIdInfo[ \t]+ctxId\b"
+)
+CONTEXT_REPORT_CALL = re.compile(
+    r"\bMsprofReportAdditionalInfo\s*\(\s*false\s*,\s*"
+    r"static_cast\s*<\s*void\s*\*>\s*\(\s*&\s*info\s*\)\s*,\s*"
+    r"sizeof\s*\(\s*MsprofAdditionalInfo\s*\)\s*\)\s*;"
+)
+CONTEXT_INFO_REPORT_REFERENCE = re.compile(
+    r"\bMsprofReportAdditionalInfo\s*\([^;]*&\s*info\b[^;]*\)\s*;",
+    re.DOTALL,
+)
+CONTEXT_GUARD = re.compile(
+    r"(?m)^[ \t]*if\s*\(\s*(?:true|false)\s*>\s*0\s*\)\s*\{[ \t]*\r?$"
+)
+CONTEXT_DATA_REFERENCE = re.compile(r"\binfo\.data(?:Len)?\b")
+CONTEXT_TYPE_REFERENCE = re.compile(
+    r"\b(?:MsprofContextIdInfo|MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE)\b"
+)
+CONTEXT_ID_REFERENCE = re.compile(r"\bctxId\b")
 
 
 def _compact_report_pattern(name: str) -> re.Pattern[str]:
@@ -297,9 +328,201 @@ def _patch_wrapper_source(source: str) -> tuple[str, int, int]:
     return effective_source, tensor_replacement_count, compact_replacement_count
 
 
+def _context_statement_lines(block: str) -> list[str]:
+    statements: list[str] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        statements.append(" ".join(stripped.split()))
+    return statements
+
+
+def _validate_context_block(block: str) -> str:
+    statements = _context_statement_lines(block)
+    shared_tail = [
+        "info.level = MSPROF_REPORT_NODE_LEVEL;",
+        "info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;",
+        "info.threadId = threadId;",
+        "info.timeStamp = endTime;",
+    ]
+    data_len = "info.dataLen = sizeof(MsprofContextIdInfo);"
+    ctx_fields = [
+        "ctxId.opName = opNameHashID;",
+        "ctxId.ctxIdNum = 1;",
+        "for (uint32_t i = 0; i < ctxId.ctxIdNum; i++) {",
+        "ctxId.ctxIds[i] = i;",
+        "}",
+        "size_t copyLen = sizeof(MsprofContextIdInfo);",
+        "if (copyLen > MSPROF_ADDTIONAL_INFO_DATA_LENGTH) {",
+        "copyLen = MSPROF_ADDTIONAL_INFO_DATA_LENGTH;",
+        "}",
+        "memcpy(info.data, &ctxId, copyLen);",
+        "MsprofReportAdditionalInfo(false, static_cast<void *>(&info), sizeof(MsprofAdditionalInfo));",
+        "}",
+    ]
+
+    for guard in ("true", "false"):
+        prefix = [f"if ({guard} > 0) {{"]
+        raw = (
+            prefix
+            + ["MsprofAdditionalInfo info;"]
+            + shared_tail
+            + ["MsprofContextIdInfo ctxId;"]
+            + ctx_fields
+        )
+        fixed = (
+            prefix
+            + ["MsprofAdditionalInfo info{};"]
+            + shared_tail
+            + [data_len, "MsprofContextIdInfo ctxId{};"]
+            + ctx_fields
+        )
+        if statements == raw:
+            return "raw"
+        if statements == fixed:
+            return "fixed"
+    raise ValueError(
+        "ContextInfo block has an unsupported declaration, assignment, alias, or condition"
+    )
+
+
+def _patch_context_info_source(source: str) -> tuple[str, int]:
+    info_declarations = list(CONTEXT_INFO_DECLARATION.finditer(source))
+    ctx_declarations = list(CONTEXT_ID_DECLARATION.finditer(source))
+    info_declaration_references = list(CONTEXT_INFO_DECLARATION_REFERENCE.finditer(source))
+    ctx_declaration_references = list(CONTEXT_ID_DECLARATION_REFERENCE.finditer(source))
+    context_type_references = list(CONTEXT_TYPE_REFERENCE.finditer(source))
+    context_report_references = list(CONTEXT_INFO_REPORT_REFERENCE.finditer(source))
+    context_reports = list(CONTEXT_REPORT_CALL.finditer(source))
+
+    has_context_shape = any(
+        (
+            info_declaration_references,
+            ctx_declaration_references,
+            context_type_references,
+            context_report_references,
+        )
+    )
+    if not has_context_shape:
+        return source, 0
+
+    if (
+        len(info_declarations) != 2
+        or len(info_declaration_references) != 2
+        or len(ctx_declarations) != 2
+        or len(ctx_declaration_references) != 2
+        or len(context_reports) != 2
+        or len(context_report_references) != 2
+    ):
+        raise ValueError(
+            "launcher wrapper must contain exactly two supported ContextInfo report blocks"
+        )
+
+    blocks: list[tuple[int, int, str]] = []
+    for index, declaration in enumerate(info_declarations):
+        next_declaration_start = (
+            info_declarations[index + 1].start()
+            if index + 1 < len(info_declarations)
+            else len(source)
+        )
+        guard_matches = list(CONTEXT_GUARD.finditer(source, 0, declaration.start()))
+        if not guard_matches:
+            raise ValueError("ContextInfo declaration has no recognized MIX task guard")
+        guard = guard_matches[-1]
+
+        reports_in_block = [
+            report
+            for report in context_reports
+            if declaration.end() <= report.start() < next_declaration_start
+        ]
+        report_references_in_block = [
+            report
+            for report in context_report_references
+            if declaration.end() <= report.start() < next_declaration_start
+        ]
+        if len(reports_in_block) != 1 or len(report_references_in_block) != 1:
+            raise ValueError("ContextInfo declaration has an unknown report boundary")
+
+        report = reports_in_block[0]
+        report_reference = report_references_in_block[0]
+        if report.start() != report_reference.start() or report.end() != report_reference.end():
+            raise ValueError("ContextInfo report call has an unsupported signature")
+
+        closing_brace = re.match(r"\s*\}[ \t]*(?=\r?(?:\n|$))", source[report.end() :])
+        if closing_brace is None:
+            raise ValueError("ContextInfo report is not the final statement in its MIX guard")
+        block_end = report.end() + closing_brace.end()
+        block = source[guard.start() : block_end]
+        state = _validate_context_block(block)
+        blocks.append((guard.start(), block_end, state))
+
+    if len(blocks) != 2:
+        raise ValueError("launcher wrapper must contain exactly two ContextInfo blocks")
+
+    for reference_group in (
+        context_type_references,
+        ctx_declaration_references,
+        context_report_references,
+        list(CONTEXT_ID_REFERENCE.finditer(source)),
+        list(CONTEXT_DATA_REFERENCE.finditer(source)),
+    ):
+        for reference in reference_group:
+            if not any(start <= reference.start() < end for start, end, _ in blocks):
+                raise ValueError("launcher wrapper contains an unsupported ContextInfo reference")
+
+    states = [state for _, _, state in blocks]
+    if states == ["fixed", "fixed"]:
+        return source, 0
+    if states != ["raw", "raw"]:
+        raise ValueError("ContextInfo blocks are partially or inconsistently initialized")
+
+    additions: list[tuple[int, int, str]] = []
+    for declaration in info_declarations:
+        indent = declaration.group("indent")
+        trailing_cr = "\r" if declaration.group(0).endswith("\r") else ""
+        initialized_declaration = f"{indent}MsprofAdditionalInfo info{{}};{trailing_cr}"
+        additions.append((declaration.start(), declaration.end(), initialized_declaration))
+
+    for declaration in ctx_declarations:
+        indent = declaration.group("indent")
+        trailing_cr = "\r" if declaration.group(0).endswith("\r") else ""
+        initialized_declaration = f"{indent}MsprofContextIdInfo ctxId{{}};{trailing_cr}"
+        additions.append((declaration.start(), declaration.end(), initialized_declaration))
+
+    for declaration in info_declarations:
+        timestamp = re.search(
+            r"(?m)^(?P<indent>[ \t]*)info\.timeStamp[ \t]*=[ \t]*endTime;"
+            r"[ \t]*(?P<cr>\r?)$",
+            source[declaration.start() :],
+        )
+        if timestamp is None:
+            raise ValueError("ContextInfo block has no recognized timestamp assignment")
+        timestamp_end = declaration.start() + timestamp.end() - len(timestamp.group("cr"))
+        line_ending = "\r\n" if timestamp.group("cr") else "\n"
+        indent = timestamp.group("indent")
+        additions.append(
+            (
+                timestamp_end,
+                timestamp_end,
+                f"{line_ending}{indent}info.dataLen = sizeof(MsprofContextIdInfo);",
+            )
+        )
+
+    for start, end, replacement in sorted(additions, reverse=True):
+        source = source[:start] + replacement + source[end:]
+    return source, 2
+
+
+def _patch_wrapper_source_with_context(source: str) -> tuple[str, int, int, int]:
+    tensor_compact_source, tensor_count, compact_count = _patch_wrapper_source(source)
+    effective_source, context_count = _patch_context_info_source(tensor_compact_source)
+    return effective_source, tensor_count, compact_count, context_count
+
+
 def patch_wrapper_source(source: str) -> str:
-    """Initialize TensorInfo and supported CompactInfo metadata, preserving other C++."""
-    return _patch_wrapper_source(source)[0]
+    """Initialize supported TensorInfo, CompactInfo, and ContextInfo metadata."""
+    return _patch_wrapper_source_with_context(source)[0]
 
 
 def _parameter_index(signature: inspect.Signature, name: str) -> int:
@@ -465,6 +688,7 @@ def install_factory_patch(
             "error_stage": "source_validation",
             "replacement_count": None,
             "compact_replacement_count": None,
+            "context_replacement_count": None,
             "original_cache_key": None,
             "effective_cache_key": None,
             "effective_cpp_sha256": None,
@@ -482,9 +706,12 @@ def install_factory_patch(
             original_src = _argument_value(signature, args, kwargs, "wrapper_src")
             if not isinstance(header_src, str) or not isinstance(original_src, str):
                 raise TypeError("launcher source arguments must be strings")
-            effective_src, replacement_count, compact_replacement_count = _patch_wrapper_source(
-                original_src
-            )
+            (
+                effective_src,
+                replacement_count,
+                compact_replacement_count,
+                context_replacement_count,
+            ) = _patch_wrapper_source_with_context(original_src)
             forwarded_args, forwarded_kwargs = _replace_argument(
                 signature, args, kwargs, "wrapper_src", effective_src
             )
@@ -500,6 +727,7 @@ def install_factory_patch(
                 "effective_cpp_sha256": sha256_text(effective_src),
                 "replacement_count": replacement_count,
                 "compact_replacement_count": compact_replacement_count,
+                "context_replacement_count": context_replacement_count,
                 "original_cache_key": original_key,
                 "effective_cache_key": effective_key,
                 "return_status": "running",
@@ -597,6 +825,7 @@ class AuditWriter:
         self.error_count = 0
         self.replacement_total = 0
         self.compact_replacement_total = 0
+        self.context_replacement_total = 0
 
     def __call__(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, sort_keys=True, default=str)
@@ -613,6 +842,9 @@ class AuditWriter:
             self.compact_replacement_total += int(
                 record.get("compact_replacement_count", 0) or 0
             )
+            self.context_replacement_total += int(
+                record.get("context_replacement_count", 0) or 0
+            )
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -622,6 +854,7 @@ class AuditWriter:
                 "launcher_errors": self.error_count,
                 "replacement_total": self.replacement_total,
                 "compact_replacement_total": self.compact_replacement_total,
+                "context_replacement_total": self.context_replacement_total,
             }
 
 
@@ -775,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest["repair_activated"] = bool(
             manifest.get("replacement_total", 0) > 0
             or manifest.get("compact_replacement_total", 0) > 0
+            or manifest.get("context_replacement_total", 0) > 0
         )
         manifest["factory_restored"] = (
             guard.namespace.get(FACTORY_NAME) is guard.original if guard is not None else None

@@ -42,8 +42,8 @@ def raw_wrapper_source(template: str = "fixture") -> str:
     """Stand in for either registered driver's generated wrapper source."""
     return f"""// {template} launcher template
 void c_triton_launch_kernel() {{
-      MsprofAdditionalInfo info;
-      info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;
+      MsprofApi info;
+      info.type = MSPROF_REPORT_NODE_LAUNCH_TYPE;
       MsprofAdditionalInfo tensorInfo;
       tensorInfo.level = MSPROF_REPORT_NODE_LEVEL;
       tensorInfo.type = MSPROF_REPORT_NODE_TENSOR_INFO_TYPE;
@@ -54,8 +54,8 @@ void c_triton_launch_kernel() {{
       MsprofReportAdditionalInfo(false, static_cast<void *>(&tensorInfo), sizeof(MsprofAdditionalInfo));
 }}
 void python_launch_entrypoint() {{
-      MsprofAdditionalInfo info;
-      info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;
+      MsprofApi info;
+      info.type = MSPROF_REPORT_NODE_LAUNCH_TYPE;
       MsprofAdditionalInfo tensorInfo;
       tensorInfo.level = MSPROF_REPORT_NODE_LEVEL;
       tensorInfo.type = MSPROF_REPORT_NODE_TENSOR_INFO_TYPE;
@@ -235,6 +235,147 @@ def remove_default_compact_metadata(source: str) -> str:
     )
 
 
+RAW_CONTEXT_BLOCK = """      // 'mix' kernel need to report the ctxID
+      if (CONTEXT_GUARD > 0) {
+        MsprofAdditionalInfo info;
+        info.level = MSPROF_REPORT_NODE_LEVEL;
+        info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;
+        info.threadId = threadId;
+        info.timeStamp = endTime;
+        MsprofContextIdInfo ctxId;
+        ctxId.opName = opNameHashID;
+        ctxId.ctxIdNum = 1;
+        for (uint32_t i = 0; i < ctxId.ctxIdNum; i++) {
+          ctxId.ctxIds[i] = i;
+        }
+        size_t copyLen = sizeof(MsprofContextIdInfo);
+        if (copyLen > MSPROF_ADDTIONAL_INFO_DATA_LENGTH) {
+          copyLen = MSPROF_ADDTIONAL_INFO_DATA_LENGTH;
+        }
+        memcpy(info.data, &ctxId, copyLen);
+        MsprofReportAdditionalInfo(false, static_cast<void *>(&info), sizeof(MsprofAdditionalInfo));
+      }"""
+
+CONTEXT_REPORT = (
+    "MsprofReportAdditionalInfo(false, static_cast<void *>(&info), "
+    "sizeof(MsprofAdditionalInfo));"
+)
+
+
+def source_with_context_blocks(source: str, guards=("false", "false")) -> str:
+    """Add the installed local/physical driver's exact generated MIX report blocks."""
+    if len(guards) != 2 or any(guard not in ("true", "false") for guard in guards):
+        raise AssertionError("generated MIX guards must be literal true/false values")
+    report_markers = source.split("      // Report tensor info")
+    if len(report_markers) != 3:
+        raise AssertionError("expected the two saved TensorInfo report sites")
+    sites = [
+        RAW_CONTEXT_BLOCK.replace("CONTEXT_GUARD", guard)
+        for guard in guards
+    ]
+    return (
+        report_markers[0]
+        + "\n"
+        + sites[0]
+        + "\n\n      // Report tensor info"
+        + report_markers[1]
+        + "\n"
+        + sites[1]
+        + "\n\n      // Report tensor info"
+        + report_markers[2]
+    )
+
+
+def fully_initialized_context_source(source: str) -> str:
+    """Return the two known fixed ContextInfo blocks for idempotence coverage."""
+    if len(re.findall(r"(?m)^[ \t]*MsprofAdditionalInfo info;[ \t]*$", source)) != 2:
+        raise AssertionError("expected two raw ContextInfo AdditionalInfo declarations")
+    if len(re.findall(r"(?m)^[ \t]*MsprofContextIdInfo ctxId;[ \t]*$", source)) != 2:
+        raise AssertionError("expected two raw ContextIdInfo declarations")
+    timestamp_pattern = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)info\.timeStamp = endTime;$"
+    )
+    timestamps = list(timestamp_pattern.finditer(source))
+    if len(timestamps) != 2:
+        raise AssertionError("expected the captured ContextInfo field order")
+    source = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)MsprofAdditionalInfo info;[ \t]*$",
+        lambda match: f"{match.group('indent')}MsprofAdditionalInfo info{{}};",
+        source,
+    )
+    source = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)MsprofContextIdInfo ctxId;[ \t]*$",
+        lambda match: f"{match.group('indent')}MsprofContextIdInfo ctxId{{}};",
+        source,
+    )
+    return timestamp_pattern.sub(
+        lambda match: (
+            f"{match.group(0)}\n{match.group('indent')}"
+            "info.dataLen = sizeof(MsprofContextIdInfo);"
+        ),
+        source,
+    )
+
+
+def remove_context_initializers(source: str) -> str:
+    source = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)MsprofAdditionalInfo info\{\};[ \t]*$",
+        lambda match: f"{match.group('indent')}MsprofAdditionalInfo info;",
+        source,
+    )
+    source = re.sub(
+        r"(?m)^[ \t]*info\.dataLen = sizeof\(MsprofContextIdInfo\);\r?\n",
+        "",
+        source,
+    )
+    return re.sub(
+        r"(?m)^(?P<indent>[ \t]*)MsprofContextIdInfo ctxId\{\};[ \t]*$",
+        lambda match: f"{match.group('indent')}MsprofContextIdInfo ctxId;",
+        source,
+    )
+
+
+def expected_tensor_and_compact_source(source: str) -> str:
+    source = expected_initialized_source(source)
+    compact_fields = (
+        "      MsprofCompactInfo nodeBasicInfo;\n"
+        "      nodeBasicInfo.dataLen = sizeof(MsprofNodeBasicInfo);\n"
+        "      nodeBasicInfo.data.nodeBasicInfo.opFlag = 0;"
+    )
+    return source.replace("      MsprofCompactInfo nodeBasicInfo;", compact_fields)
+
+
+def invoke_registered_wrapper_source(
+    fixture_name: str, source: str, audit_callback=None
+):
+    entrypoint = (
+        "generate_npu_wrapper_src"
+        if fixture_name == "local-generate_npu_wrapper_src"
+        else "make_launcher"
+    )
+    namespace, registry, factory_calls = make_registered_backend(
+        "triton.backends.ascend.driver",
+        wrapper_sources={fixture_name: source},
+    )
+    original_factory = namespace["make_npu_launcher_stub"]
+    audit_records: list[dict[str, object]] = []
+    callback = audit_records.append if audit_callback is None else audit_callback
+    error = None
+    result = None
+    with overlay.install_registered_backend_patch(
+        registry, audit_callback=callback
+    ):
+        launcher_class = namespace["NPULauncher"]
+        launcher = object.__new__(launcher_class)
+        launcher.template_entrypoint = entrypoint
+        launcher.debug = False
+        try:
+            result = launcher._make_launcher_stub_path()
+        except (RuntimeError, ValueError) as caught:
+            error = caught
+    return namespace, original_factory, factory_calls, audit_records, error, result
+
+
 class PatchWrapperSourceTests(unittest.TestCase):
     def test_initializes_both_tensor_info_records_and_preserves_other_source(self) -> None:
         for template in ("local-generate_npu_wrapper_src", "physical-make_launcher"):
@@ -249,8 +390,10 @@ class PatchWrapperSourceTests(unittest.TestCase):
                 self.assertEqual(
                     patched.count("tensorInfo.dataLen = sizeof(MsprofTensorInfo);"), 2
                 )
-                self.assertEqual(patched.count("MsprofAdditionalInfo info;"), 2)
-                self.assertEqual(patched.count("MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE"), 2)
+                self.assertEqual(patched.count("MsprofApi info;"), 2)
+                self.assertEqual(
+                    patched.count("info.type = MSPROF_REPORT_NODE_LAUNCH_TYPE;"), 2
+                )
                 self.assertEqual(patched.count("MSPROF_REPORT_NODE_TENSOR_INFO_TYPE"), 2)
                 self.assertEqual(patched.count("MSPROF_GE_TENSOR_DATA_NUM"), 2)
                 self.assertEqual(patched.count("MSPROF_GE_TENSOR_DATA_SHAPE_LEN"), 2)
@@ -720,6 +863,213 @@ class CapturedCompactInfoFactoryTests(unittest.TestCase):
             self.assertEqual(len(factory_calls), 2)
 
 
+class CapturedContextInfoFactoryTests(unittest.TestCase):
+    def test_raw_local_false_and_physical_true_guards_are_initialized_at_factory(self) -> None:
+        saved_sources = saved_generated_wrapper_sources()
+        cases = (
+            ("local-generate_npu_wrapper_src", "false", "MSPROF_GE_TASK_TYPE_AIV"),
+            ("physical-make_launcher", "true", "MSPROF_GE_TASK_TYPE_MIX_AIV"),
+        )
+        for fixture_name, guard, task_type in cases:
+            with self.subTest(fixture=fixture_name, guard=guard):
+                source = source_with_context_blocks(
+                    saved_sources[fixture_name], (guard, guard)
+                )
+                source = source.replace(
+                    "nodeBasicInfo.data.nodeBasicInfo.taskType = "
+                    "MSPROF_GE_TASK_TYPE_AIV;",
+                    "nodeBasicInfo.data.nodeBasicInfo.taskType = "
+                    f"{task_type};",
+                )
+                namespace, original_factory, factory_calls, records, error, result = (
+                    invoke_registered_wrapper_source(fixture_name, source)
+                )
+
+                self.assertIsNone(error)
+                self.assertIs(namespace["make_npu_launcher_stub"], original_factory)
+                self.assertEqual(len(factory_calls), 1)
+                forwarded = factory_calls[0]["wrapper_src"]
+                assert isinstance(forwarded, str)
+                self.assertEqual(
+                    remove_context_initializers(forwarded),
+                    expected_tensor_and_compact_source(source),
+                )
+                self.assertEqual(forwarded.count("MsprofAdditionalInfo info{};"), 2)
+                self.assertEqual(forwarded.count("MsprofContextIdInfo ctxId{};"), 2)
+                self.assertEqual(
+                    forwarded.count(
+                        "info.dataLen = sizeof(MsprofContextIdInfo);"
+                    ),
+                    2,
+                )
+                self.assertEqual(forwarded.count(f"if ({guard} > 0)"), 2)
+                self.assertEqual(forwarded.count(CONTEXT_REPORT), 2)
+                self.assertEqual(forwarded.count("ctxId.opName = opNameHashID;"), 2)
+                self.assertEqual(forwarded.count("ctxId.ctxIdNum = 1;"), 2)
+                self.assertEqual(
+                    forwarded.count("ctxId.ctxIds[i] = i;"),
+                    2,
+                )
+                self.assertEqual(
+                    forwarded.count(f"taskType = {task_type};"), 2
+                )
+                self.assertEqual(factory_calls[0]["debug"], False)
+                self.assertEqual(result["cache_key"], factory_calls[0]["cache_key"])
+                self.assertEqual(records[0]["return_status"], "ok")
+                self.assertEqual(records[0]["replacement_count"], 2)
+                self.assertEqual(records[0]["compact_replacement_count"], 2)
+                self.assertEqual(records[0]["context_replacement_count"], 2)
+
+    def test_fully_initialized_context_blocks_are_idempotent(self) -> None:
+        fixture_name = "local-generate_npu_wrapper_src"
+        raw_source = source_with_context_blocks(
+            saved_generated_wrapper_sources()[fixture_name], ("true", "true")
+        )
+        fixed_source = fully_initialized_context_source(raw_source)
+        namespace, original_factory, factory_calls, records, error, _ = (
+            invoke_registered_wrapper_source(fixture_name, fixed_source)
+        )
+
+        self.assertIsNone(error)
+        self.assertIs(namespace["make_npu_launcher_stub"], original_factory)
+        self.assertEqual(len(factory_calls), 1)
+        forwarded = factory_calls[0]["wrapper_src"]
+        assert isinstance(forwarded, str)
+        self.assertEqual(
+            forwarded,
+            expected_tensor_and_compact_source(fixed_source),
+        )
+        self.assertEqual(overlay.patch_wrapper_source(forwarded), forwarded)
+        self.assertEqual(records[0]["replacement_count"], 2)
+        self.assertEqual(records[0]["compact_replacement_count"], 2)
+        self.assertEqual(records[0]["context_replacement_count"], 0)
+
+    def test_context_only_audit_totals_are_independent(self) -> None:
+        fixture_name = "local-generate_npu_wrapper_src"
+        raw_source = source_with_context_blocks(
+            saved_generated_wrapper_sources()[fixture_name], ("true", "true")
+        )
+        tensor_compact_fixed = expected_tensor_and_compact_source(raw_source)
+        factory_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def native_factory(header_src, wrapper_src, debug=False):
+            factory_calls.append(((header_src, wrapper_src, debug), {}))
+            return "native-result"
+
+        with tempfile.TemporaryDirectory(prefix="context audit ") as temporary:
+            writer = overlay.AuditWriter(Path(temporary))
+            namespace = {"make_npu_launcher_stub": native_factory}
+            with overlay.install_factory_patch(namespace, audit_callback=writer):
+                namespace["make_npu_launcher_stub"](
+                    HEADER_SRC, tensor_compact_fixed, False
+                )
+
+            records = [
+                json.loads(line)
+                for line in writer.calls_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["replacement_count"], 0)
+            self.assertEqual(records[0]["compact_replacement_count"], 0)
+            self.assertEqual(records[0]["context_replacement_count"], 2)
+            snapshot = writer.snapshot()
+            self.assertEqual(snapshot["replacement_total"], 0)
+            self.assertEqual(snapshot["compact_replacement_total"], 0)
+            self.assertEqual(snapshot["context_replacement_total"], 2)
+            self.assertEqual(len(factory_calls), 1)
+
+    def test_unknown_mixed_alias_and_changed_guard_shapes_fail_before_native_factory(self) -> None:
+        fixture_name = "local-generate_npu_wrapper_src"
+        source = source_with_context_blocks(
+            saved_generated_wrapper_sources()[fixture_name], ("false", "false")
+        )
+        fully_fixed = fully_initialized_context_source(source)
+        mixed = fully_fixed
+        mixed = mixed.replace(
+            "        MsprofAdditionalInfo info{};",
+            "        MsprofAdditionalInfo info;",
+            1,
+        )
+        mixed = mixed.replace(
+            "        info.dataLen = sizeof(MsprofContextIdInfo);\n", "", 1
+        )
+        mixed = mixed.replace(
+            "        MsprofContextIdInfo ctxId{};",
+            "        MsprofContextIdInfo ctxId;",
+            1,
+        )
+        bad_sources = {
+            "one-block-fixed": mixed,
+            "partial-info-initializer": source.replace(
+                "        MsprofAdditionalInfo info;",
+                "        MsprofAdditionalInfo info{};",
+                1,
+            ),
+            "partial-ctxid-initializer": source.replace(
+                "        MsprofContextIdInfo ctxId;",
+                "        MsprofContextIdInfo ctxId{};",
+                1,
+            ),
+            "wrong-data-len": source.replace(
+                "        MsprofContextIdInfo ctxId;",
+                "        info.dataLen = sizeof(MsprofTensorInfo);\n"
+                "        MsprofContextIdInfo ctxId;",
+                1,
+            ),
+            "duplicate-data-len": source.replace(
+                "        MsprofContextIdInfo ctxId;",
+                "        info.dataLen = sizeof(MsprofContextIdInfo);\n"
+                "        info.dataLen = sizeof(MsprofContextIdInfo);\n"
+                "        MsprofContextIdInfo ctxId;",
+                1,
+            ),
+            "changed-guard": source.replace(
+                "if (false > 0)", "if (mix_enabled > 0)", 1
+            ),
+            "changed-copy-condition": source.replace(
+                "if (copyLen > MSPROF_ADDTIONAL_INFO_DATA_LENGTH)",
+                "if (copyLen >= MSPROF_ADDTIONAL_INFO_DATA_LENGTH)",
+                1,
+            ),
+            "ctxid-alias": source.replace(
+                "        memcpy(info.data, &ctxId, copyLen);",
+                "        auto &ctxAlias = ctxId;\n"
+                "        memcpy(info.data, &ctxId, copyLen);",
+                1,
+            ),
+            "whole-info-overwrite": source.replace(
+                "        memcpy(info.data, &ctxId, copyLen);",
+                "        info = MsprofAdditionalInfo{};\n"
+                "        memcpy(info.data, &ctxId, copyLen);",
+                1,
+            ),
+            "wrong-record-type": source.replace(
+                "info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;",
+                "info.type = MSPROF_REPORT_NODE_TENSOR_INFO_TYPE;",
+                1,
+            ),
+            "extra-unreported-context-id": source.replace(
+                "        MsprofContextIdInfo ctxId;",
+                "        MsprofContextIdInfo ctxId;\n"
+                "        MsprofContextIdInfo alias;",
+                1,
+            ),
+        }
+
+        for shape, bad_source in bad_sources.items():
+            with self.subTest(shape=shape):
+                namespace, original_factory, factory_calls, records, error, _ = (
+                    invoke_registered_wrapper_source(fixture_name, bad_source)
+                )
+                self.assertIsNotNone(error)
+                self.assertIsInstance(error, (RuntimeError, ValueError))
+                self.assertIs(namespace["make_npu_launcher_stub"], original_factory)
+                self.assertEqual(factory_calls, [])
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["return_status"], "error")
+                self.assertEqual(records[0]["error_stage"], "source_validation")
+
+
 class RegisteredBackendTests(unittest.TestCase):
     def test_registered_namespace_wins_over_both_module_aliases_and_templates(self) -> None:
         for module_name in ("ascend", "triton.backends.ascend.driver"):
@@ -775,8 +1125,9 @@ class RegisteredBackendTests(unittest.TestCase):
             self.assertEqual(len(audit_records), 2)
 
     def test_real_cli_run_path_preserves_relative_argv_and_restores_process_state(self) -> None:
+        wrapper_sources: dict[str, str] = {}
         namespace, registry, factory_calls = make_registered_backend(
-            "triton.backends.ascend.driver"
+            "triton.backends.ascend.driver", wrapper_sources=wrapper_sources
         )
         native_factory = namespace["make_npu_launcher_stub"]
 
@@ -846,9 +1197,20 @@ class RegisteredBackendTests(unittest.TestCase):
                         ("exit-nonzero", "generate_npu_wrapper_src", "system_exit", 7, True),
                         ("raise", "make_launcher", "error", 1, True),
                         ("no-call", "generate_npu_wrapper_src", "no_launcher_calls", 0, False),
+                        ("context-only", "generate_npu_wrapper_src", "ok", 0, True),
                     )
                     for index, (mode, template, status, exit_code, calls_factory) in enumerate(scenarios):
                         with self.subTest(mode=mode, template=template):
+                            if mode == "context-only":
+                                context_source = source_with_context_blocks(
+                                    saved_generated_wrapper_sources()[
+                                        "local-generate_npu_wrapper_src"
+                                    ],
+                                    ("true", "true"),
+                                )
+                                wrapper_sources[
+                                    "local-generate_npu_wrapper_src"
+                                ] = expected_tensor_and_compact_source(context_source)
                             calls_before = len(factory_calls)
                             capture_path = temporary_path / f"capture {index}.json"
                             audit_dir = temporary_path / f"audit {index}"
@@ -868,7 +1230,7 @@ class RegisteredBackendTests(unittest.TestCase):
                                 caught_error = error
                                 cli_exit = None
 
-                            if mode in ("normal", "no-call"):
+                            if mode in ("normal", "no-call", "context-only"):
                                 self.assertIsNone(caught_error)
                                 self.assertEqual(cli_exit, 0)
                             elif mode.startswith("exit-"):
@@ -901,11 +1263,17 @@ class RegisteredBackendTests(unittest.TestCase):
                                     if template == "generate_npu_wrapper_src"
                                     else "physical-make_launcher"
                                 )
+                                if mode == "context-only":
+                                    expected_wrapper_source = fully_initialized_context_source(
+                                        wrapper_sources[expected_template]
+                                    )
+                                else:
+                                    expected_wrapper_source = expected_initialized_source(
+                                        raw_wrapper_source(expected_template)
+                                    )
                                 self.assertEqual(
                                     factory_calls[-1]["wrapper_src"],
-                                    expected_initialized_source(
-                                        raw_wrapper_source(expected_template)
-                                    ),
+                                    expected_wrapper_source,
                                 )
                             else:
                                 self.assertIsNone(captured["result"])
@@ -922,6 +1290,13 @@ class RegisteredBackendTests(unittest.TestCase):
                             self.assertEqual(manifest["exit_code"], exit_code)
                             self.assertEqual(manifest["launcher_calls"], int(calls_factory))
                             self.assertEqual(manifest["repair_activated"], calls_factory)
+                            self.assertEqual(
+                                manifest["context_replacement_total"],
+                                2 if mode == "context-only" else 0,
+                            )
+                            if mode == "context-only":
+                                self.assertEqual(manifest["replacement_total"], 0)
+                                self.assertEqual(manifest["compact_replacement_total"], 0)
                             self.assertTrue(manifest["factory_restored"])
                             self.assertEqual(manifest["script_path_argument"], relative_script)
                             self.assertEqual(manifest["script_argv"], script_arguments)
