@@ -109,7 +109,17 @@ output_num,output_formats,output_dtypes,output_shapes
 
 SDK 单包最多包含 5 个 tensor slot、每个 shape 最多 8 个维度；当前 Triton producer 只发一个包，超出容量会截断。
 SDK shape 数组未携带 rank，零长度维度与填充零无法无损区分；CSV 还会省略零项。raw JSON 保留八个原值，但不据此推断完整 rank。
-Triton producer overlay 通过 [proxy 或 CLI overlay](docs/triton_tensorinfo_producer.md) 启用：它初始化 TensorInfo 长度，并修复受支持 CompactInfo 的 `dataLen = sizeof(MsprofNodeBasicInfo)` 和缺省 `opFlag = 0`。默认值适用于当前生成器的 `AIV`、`AI_CORE`、`MIX_AIC`、`MIX_AIV` 四种 `taskType`；`taskType` 与 `TaskInfo.execMode` 是不同字段，HF32 走单独的执行模式路径，不从 task type 推断。已识别但缺少一个或两个字段的 CompactInfo 只补缺项；未知 task type、冲突赋值或带条件控制流的布局会拒绝修补。CompactInfo 的 report 长度仍为 `sizeof(MsprofCompactInfo)`；仅用 `LD_PRELOAD` 加载 hook 不会修改 producer，SDK ABI、安装的 driver 和 cache 实现也不变。
+Triton producer overlay 通过 [proxy 或 CLI overlay](docs/triton_tensorinfo_producer.md) 启用：它初始化 TensorInfo 长度，修复受支持 CompactInfo 的 `dataLen = sizeof(MsprofNodeBasicInfo)` 和缺省 `opFlag = 0`，并修复当前 MIX ContextInfo producer。ContextInfo 的两个字段对象按值初始化；其 `dataLen` 对应模板实际复制的完整 `sizeof(MsprofContextIdInfo)`，因此未使用的 context ID 槽位为零。CANN 的不同 producer 对 ContextInfo 长度使用不同做法，这里记录的是当前 Triton 完整结构复制路径的契约，不是通用 SDK 长度规则。补丁保留原 MIX guard 和报告调用；未知、部分或结构混杂的 ContextInfo 布局拒绝修补。ContextInfo 使用独立的 `context_replacement_count` / `context_replacement_total` 审计计数，不并入 TensorInfo 或 CompactInfo 计数。
+
+CompactInfo 默认值适用于当前生成器的 `AIV`、`AI_CORE`、`MIX_AIC`、`MIX_AIV` 四种 `taskType`；`taskType` 与 `TaskInfo.execMode` 是不同字段，HF32 走单独的执行模式路径，不从 task type 推断。已识别但缺少一个或两个字段的 CompactInfo 只补缺项；未知 task type、冲突赋值或带条件控制流的布局会拒绝修补。CompactInfo 的 report 长度仍为 `sizeof(MsprofCompactInfo)`；仅用 `LD_PRELOAD` 加载 hook 不会修改 producer，SDK ABI、安装的 driver 和 cache 实现也不变。
+
+可在有 CANN SDK 头文件和 C++ 编译器的 CPU 环境运行 ContextInfo producer 合约检查，无需 NPU 或 CANN 运行时库：
+
+```bash
+python3 test/test_context_header_contract.py --cxx /usr/bin/g++ --sdk-include-dir /root/miniconda3/envs/cann910/Ascend/cann-9.1.0/include/experiment/msprof
+```
+
+此探针通过 registered factory seam 检查 local/physical 两个模板别名及 MIX/non-MIX guard，并按 SDK 的 `sizeof(MsprofContextIdInfo)` 验证 payload。本地 ContextInfo、CompactInfo SDK probes（各 8 cases）和 20 项 CPU unit tests 均已通过。保存的 physical template 只在本地 x86 SDK/compiler 下编译并由 CPU stub 检查，不代表 ARM 编译或真机验证。本轮未运行远端 NPU 训练，待远端恢复后再验证；CPU 探针不代表训练行为或数值等价结果，训练结果应单独记录。
 
 有 CANN SDK 头文件和 C++ 编译器时，可在 CPU 环境运行 CompactInfo producer 合约检查；它会对 local/physical 两种模板分别验证四种 task type，无需 NPU 或 CANN 运行时库：
 
